@@ -38,7 +38,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV2 {
+public class PrestigeConsoleScannerV3 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -48,6 +48,9 @@ public class PrestigeConsoleScannerV2 {
     static readonly HashSet<string> Findings = new HashSet<string>();
     static StreamWriter report;
     static HashSet<int> gamePids=new HashSet<int>();
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int handle);
+    [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
+    static bool OrangeSupported() { uint mode; return GetConsoleMode(GetStdHandle(-11),out mode) && (mode&4)!=0; }
     static void Log(string s) {
         report.WriteLine(s);
         bool exact=s.StartsWith("EXACT |");
@@ -57,6 +60,10 @@ public class PrestigeConsoleScannerV2 {
         var fg=Console.ForegroundColor; var bg=Console.BackgroundColor;
         try {
             if(exact){Console.BackgroundColor=ConsoleColor.DarkRed;Console.ForegroundColor=ConsoleColor.White;}
+            else if(s.StartsWith("FILE INDICATOR |")) {
+                if(OrangeSupported()){Console.WriteLine("\u001b[1;38;2;255;165;0m"+display+"\u001b[0m");return;}
+                Console.ForegroundColor=ConsoleColor.DarkYellow;
+            }
             else if(section){Console.BackgroundColor=ConsoleColor.DarkCyan;Console.ForegroundColor=ConsoleColor.White;}
             else if(s.StartsWith("LINKED") || s.StartsWith("REVIEW")) Console.ForegroundColor=ConsoleColor.Yellow;
             else if(s.StartsWith("GENERIC") || s.StartsWith("Coverage incomplete") || s.StartsWith("Unavailable")) Console.ForegroundColor=ConsoleColor.Magenta;
@@ -92,6 +99,32 @@ public class PrestigeConsoleScannerV2 {
             }
         }
     }
+    static string JarFileIndicator(string path) {
+        if(LoaderStructure(path)) return "Known loader manifest and class structure";
+        // Inspect bounded, decompressed class data. Treat strings as supporting evidence only.
+        using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read)) {
+            int budget=4*1024*1024;
+            byte[] block=new byte[65536+Overlap], chunk=new byte[65536];
+            foreach(var entry in z.Entries) {
+                if(!entry.FullName.EndsWith(".class",StringComparison.OrdinalIgnoreCase) || entry.Length<4) continue;
+                int carry=0,mask=0;
+                using(var stream=entry.Open()) {
+                    while(budget>0) {
+                        int n=stream.Read(chunk,0,Math.Min(chunk.Length,budget));
+                        if(n==0)break;
+                        Buffer.BlockCopy(chunk,0,block,carry,n); int length=carry+n;
+                        mask=MatchBlock(block,length,mask);budget-=n;
+                        if((mask&3)!=0) return "Prestige loader endpoint in "+entry.FullName;
+                        int pair=3<<Markers.Length;
+                        if((mask&pair)==pair) return "Paired Prestige console strings in "+entry.FullName;
+                        carry=Math.Min(length,Overlap);Buffer.BlockCopy(block,length-carry,block,0,carry);
+                    }
+                }
+                if(budget==0)break;
+            }
+        }
+        return null;
+    }
     static void Disk(string[] roots) {
         int files=0, hashes=0, errors=0, links=0;
         var pending=new Stack<string>(roots);
@@ -108,16 +141,17 @@ public class PrestigeConsoleScannerV2 {
                 }
                 files++;
                 long length=new FileInfo(path).Length;
-                if(path.EndsWith(".jar",StringComparison.OrdinalIgnoreCase) && length<=4*1024*1024 && length>0) {
-                    try { if(LoaderStructure(path)) Hit("REVIEW | JAR manifest and class match the reference loader structure | "+path); }
-                    catch(InvalidDataException){errors++;}
+                if(length==8119 || length==237848) {
+                    hashes++;
+                    using(var f=File.OpenRead(path)) using(var sha=SHA256.Create()) {
+                        string h=BitConverter.ToString(sha.ComputeHash(f)).Replace("-","").ToLowerInvariant();
+                        string sample=Sample(h);
+                        if(sample!=null){Hit("EXACT | "+sample+" on disk | "+path+" | "+h);continue;}
+                    }
                 }
-                if(length!=8119 && length!=237848) continue;
-                hashes++;
-                using(var f=File.OpenRead(path)) using(var sha=SHA256.Create()) {
-                    string h=BitConverter.ToString(sha.ComputeHash(f)).Replace("-","").ToLowerInvariant();
-                    string sample=Sample(h);
-                    if(sample!=null) Hit("EXACT | "+sample+" on disk | "+path+" | "+h);
+                if(path.EndsWith(".jar",StringComparison.OrdinalIgnoreCase) && length<=4*1024*1024 && length>0) {
+                    try { string reason=JarFileIndicator(path); if(reason!=null)Hit("FILE INDICATOR | "+reason+" | "+path); }
+                    catch(InvalidDataException){errors++;}
                 }
             } catch(UnauthorizedAccessException){errors++;} catch(IOException){errors++;}
         }
@@ -287,7 +321,7 @@ public class PrestigeConsoleScannerV2 {
                         if(path==null || !checkedPaths.Add(path) || !File.Exists(path)) continue;
                         try {
                             if(new FileInfo(path).Length<=4*1024*1024 && LoaderStructure(path))
-                                Hit("REVIEW | Prefetch-referenced JAR currently matches loader structure | "+name+" | "+path);
+                                Hit("FILE INDICATOR | Prefetch-referenced JAR currently matches loader structure | "+name+" | "+path);
                         } catch(InvalidDataException){skipped++;}
                     }
                 }
@@ -433,7 +467,7 @@ public class PrestigeConsoleScannerV2 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV2' -as [type])) {
+if (!('PrestigeConsoleScannerV3' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 $minecraftIds = @()
@@ -449,6 +483,6 @@ if ($Mode -ne '2') {
     } catch { Write-Host 'Minecraft identification unavailable. Checking all Java processes.' -ForegroundColor Yellow }
     if (!$minecraftIds.Count) { Write-Host 'No Minecraft client identified by launch arguments. Checking all Java processes.' -ForegroundColor Yellow }
 }
-$status = [PrestigeConsoleScannerV2]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds)
+$status = [PrestigeConsoleScannerV3]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds)
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
