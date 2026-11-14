@@ -20,7 +20,7 @@ if ([string]::IsNullOrWhiteSpace($outputFolder)) {
     if ([string]::IsNullOrWhiteSpace($outputFolder)) { $outputFolder = $env:TEMP }
 }
 
-Write-Host 'Prestige Scanner' -ForegroundColor Cyan
+Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
 Write-Host 'Starting scan...' -ForegroundColor Cyan
 
 $engine = @'
@@ -38,7 +38,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigePowerShellScanner {
+public class PrestigeConsoleScannerV2 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -47,7 +47,23 @@ public class PrestigePowerShellScanner {
     static readonly Encoding Bytes = Encoding.GetEncoding(28591);
     static readonly HashSet<string> Findings = new HashSet<string>();
     static StreamWriter report;
-    static void Log(string s) { Console.WriteLine(s); report.WriteLine(s); }
+    static HashSet<int> gamePids=new HashSet<int>();
+    static void Log(string s) {
+        report.WriteLine(s);
+        bool exact=s.StartsWith("EXACT |");
+        bool section=s.TrimStart().StartsWith("---") || s.StartsWith("MINECRAFT");
+        string display=exact ? "[DIRECT PRESTIGE MATCH] "+s : s;
+        if(Console.IsOutputRedirected){Console.WriteLine(display);return;}
+        var fg=Console.ForegroundColor; var bg=Console.BackgroundColor;
+        try {
+            if(exact){Console.BackgroundColor=ConsoleColor.DarkRed;Console.ForegroundColor=ConsoleColor.White;}
+            else if(section){Console.BackgroundColor=ConsoleColor.DarkCyan;Console.ForegroundColor=ConsoleColor.White;}
+            else if(s.StartsWith("LINKED") || s.StartsWith("REVIEW")) Console.ForegroundColor=ConsoleColor.Yellow;
+            else if(s.StartsWith("GENERIC") || s.StartsWith("Coverage incomplete") || s.StartsWith("Unavailable")) Console.ForegroundColor=ConsoleColor.Magenta;
+            else Console.ForegroundColor=ConsoleColor.Gray;
+            Console.WriteLine(display);
+        } finally {Console.BackgroundColor=bg;Console.ForegroundColor=fg;}
+    }
     static void Hit(string s) { if (Findings.Add(s)) Log(s); }
     static string Sample(string hashes) {
         foreach (string item in hashes.Split(',',';')) {
@@ -166,10 +182,12 @@ public class PrestigePowerShellScanner {
         return false;
     }
     static void Memory() {
-        var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).ToArray();
+        var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
         foreach(var p in processes) using(p) {
             int pid=p.Id;
+            string target=gamePids.Contains(pid)?"MINECRAFT CLIENT":"Java (client identity unconfirmed)";
+            Log(target+" | scanning live PID "+pid);
             try { var start=p.StartTime.ToUniversalTime(); Log("Java PID "+pid+" | start UTC "+start.ToString("u")+" | uptime "+(DateTime.UtcNow-start).ToString(@"d\.hh\:mm\:ss")); }
             catch(System.ComponentModel.Win32Exception){Log("Start time unavailable for PID "+pid);}
             catch(InvalidOperationException){Log("PID "+pid+" exited.");continue;}
@@ -223,7 +241,9 @@ public class PrestigePowerShellScanner {
                     } else tail=0;
                     address=end;
                 }
-                Log("JVM "+pid+": "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
+                int markerCount=Markers.Where((m,i)=>(mask&(1<<i))!=0).Count();
+                bool consolePair=(mask&(3<<Markers.Length))==(3<<Markers.Length);
+                Log(target+" | PID "+pid+" | loader markers: "+markerCount+" | Prestige console pair: "+consolePair+" | "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
             } finally { CloseHandle(h); }
         }
     }
@@ -384,7 +404,7 @@ public class PrestigePowerShellScanner {
         Log(Environment.NewLine+"--- "+label+" ---");
         try {action();} catch(Exception e){Log("Coverage incomplete: "+e.Message);}
     }
-    public static int Scan(string[] args,string outputDir) { Findings.Clear();
+    public static int Scan(string[] args,string outputDir,int[] minecraftIds) { Findings.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
@@ -413,9 +433,22 @@ public class PrestigePowerShellScanner {
 }
 
 '@
-if (!('PrestigePowerShellScanner' -as [type])) {
+if (!('PrestigeConsoleScannerV2' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
-$status = [PrestigePowerShellScanner]::Scan([string[]]@($Mode), $outputFolder)
+$minecraftIds = @()
+if ($Mode -ne '2') {
+    try {
+        $java = Get-CimInstance Win32_Process -Filter "Name='javaw.exe' OR Name='java.exe'" -Property ProcessId,CommandLine -ErrorAction Stop
+        $clientEntry = '(?i)(?:^|\s|")(?:net\.minecraft\.client\.main\.Main|(?:net\.fabricmc\.loader(?:\.impl)?|org\.quiltmc\.loader\.impl)\.launch\.knot\.KnotClient)(?=\s|"|$)'
+        $minecraftIds = @($java | Where-Object {
+            $_.CommandLine -match $clientEntry -or
+            $_.CommandLine -match '(?i)--launchTarget(?:\s+|=)"?(?:forgeclient|neoforgeclient|fmlclient)(?:\s|"|$)' -or
+            ($_.CommandLine -match '(?i)--gameDir\b' -and $_.CommandLine -match '(?i)--assetsDir\b' -and $_.CommandLine -match '(?i)--assetIndex\b')
+        } | ForEach-Object { [int]$_.ProcessId })
+    } catch { Write-Host 'Minecraft identification unavailable. Checking all Java processes.' -ForegroundColor Yellow }
+    if (!$minecraftIds.Count) { Write-Host 'No Minecraft client identified by launch arguments. Checking all Java processes.' -ForegroundColor Yellow }
+}
+$status = [PrestigeConsoleScannerV2]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds)
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
