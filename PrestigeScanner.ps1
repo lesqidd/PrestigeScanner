@@ -38,7 +38,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV3 {
+public class PrestigeConsoleScannerV4 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -65,6 +65,7 @@ public class PrestigeConsoleScannerV3 {
                 Console.ForegroundColor=ConsoleColor.DarkYellow;
             }
             else if(section){Console.BackgroundColor=ConsoleColor.DarkCyan;Console.ForegroundColor=ConsoleColor.White;}
+            else if(s.StartsWith("LIVE UI LEAD")) Console.ForegroundColor=ConsoleColor.Yellow;
             else if(s.StartsWith("LINKED") || s.StartsWith("REVIEW")) Console.ForegroundColor=ConsoleColor.Yellow;
             else if(s.StartsWith("GENERIC") || s.StartsWith("Coverage incomplete") || s.StartsWith("Unavailable")) Console.ForegroundColor=ConsoleColor.Magenta;
             else Console.ForegroundColor=ConsoleColor.Gray;
@@ -167,7 +168,17 @@ public class PrestigeConsoleScannerV3 {
     static readonly string[] Markers = {Host+"/stage2Download", Host+"/launcherDownload","net/taskflow/sched/TaskScheduler","net.taskflow.sched.TaskScheduler"};
     static readonly string[] ConsoleLines = {"Initializing Prestige","Hook mode: Legacy (JVMTI retransform)"};
     // Skip positions whose trailing byte pair cannot end any marker prefix.
-    static readonly string[] Labels = Markers.Concat(ConsoleLines).ToArray();
+    static readonly string[] UiText = {"Prestige","Anchor Macro","Auto Hit Crystal","Auto Shield Breaker","Automatic anchor place, charge, and explode","Attacks nearby crystals to deal burst damage","Breaks enemy shields by swapping to an axe"};
+    static readonly string[] Labels = Markers.Concat(ConsoleLines).Concat(UiText).ToArray();
+    static int UiBits(int mask) {return mask >> (Markers.Length+ConsoleLines.Length);}
+    static bool UiMatch(int mask) {
+        int bits=UiBits(mask);
+        if((bits&1)==0) return false;
+        int pairs=0;
+        for(int i=0;i<3;i++)
+            if((bits&(2<<i))!=0 && (bits&(16<<i))!=0) pairs++;
+        return pairs>=2;
+    }
     static readonly byte[][] Patterns = Labels.SelectMany(s => new[]{Encoding.ASCII.GetBytes(s),Encoding.Unicode.GetBytes(s)}).ToArray();
     static readonly int Window = Patterns.Min(p=>p.Length);
     static readonly int Overlap = Patterns.Max(p=>p.Length)-1;
@@ -258,6 +269,8 @@ public class PrestigeConsoleScannerV3 {
                                 for(int i=0;i<Markers.Length;i++)
                                     if(((mask^previous)&(1<<i))!=0)
                                         Hit("REVIEW | JVM PID "+pid+" contains loader marker | "+Markers[i]+" | string presence alone does not establish execution");
+                                if(gamePids.Contains(pid) && !UiMatch(previous) && UiMatch(mask))
+                                    Hit("LIVE UI LEAD | Minecraft PID "+pid+" contains Prestige branding and at least two matching module names and descriptions | check the visible client");
                                 int pairMask=3<<Markers.Length;
                                 if((previous&pairMask)!=pairMask && (mask&pairMask)==pairMask)
                                     Hit("REVIEW | Both reported Prestige Legacy console strings in Java PID "+pid+" | same-process text evidence; build and execution unverified");
@@ -277,7 +290,7 @@ public class PrestigeConsoleScannerV3 {
                 }
                 int markerCount=Markers.Where((m,i)=>(mask&(1<<i))!=0).Count();
                 bool consolePair=(mask&(3<<Markers.Length))==(3<<Markers.Length);
-                Log(target+" | PID "+pid+" | loader markers: "+markerCount+" | Prestige console pair: "+consolePair+" | "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
+                Log(target+" | PID "+pid+" | loader markers: "+markerCount+" | Prestige UI signature: "+(gamePids.Contains(pid)?(UiMatch(mask)?"matched":"no match"):"unclassified JVM")+" | Prestige console pair: "+consolePair+" | "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
             } finally { CloseHandle(h); }
         }
     }
@@ -467,7 +480,7 @@ public class PrestigeConsoleScannerV3 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV3' -as [type])) {
+if (!('PrestigeConsoleScannerV4' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 $minecraftIds = @()
@@ -483,6 +496,6 @@ if ($Mode -ne '2') {
     } catch { Write-Host 'Minecraft identification unavailable. Checking all Java processes.' -ForegroundColor Yellow }
     if (!$minecraftIds.Count) { Write-Host 'No Minecraft client identified by launch arguments. Checking all Java processes.' -ForegroundColor Yellow }
 }
-$status = [PrestigeConsoleScannerV3]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds)
+$status = [PrestigeConsoleScannerV4]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds)
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
