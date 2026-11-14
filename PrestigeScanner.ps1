@@ -1,16 +1,18 @@
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
 [CmdletBinding()]
 param([string]$Mode)
 
 $ErrorActionPreference = 'Stop'
-if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) {
-    throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
-}
-
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Start Windows PowerShell with Run as administrator.'
+    Write-Host 'ERROR: ' -ForegroundColor Red -NoNewline
+    Write-Host 'Administrator privileges required!'
+    Write-Host
+    Write-Host 'Please launch CMD or PowerShell as admin!' -ForegroundColor Yellow
+    return
+}
+if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) {
+    throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
 }
 $outputFolder = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($outputFolder)) {
