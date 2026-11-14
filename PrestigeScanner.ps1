@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 [CmdletBinding()]
-param([string]$Mode)
+param([ValidateSet('1','2','3')][string]$Mode = '3')
 
 $ErrorActionPreference = 'Stop'
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -21,11 +21,7 @@ if ([string]::IsNullOrWhiteSpace($outputFolder)) {
 }
 
 Write-Host 'Prestige Scanner' -ForegroundColor Cyan
-Write-Host '[1] Live Java memory'
-Write-Host '[2] Loader files, Prefetch and PowerShell history'
-Write-Host '[3] Both scans'
-if (!$Mode) { $Mode = Read-Host 'Select 1, 2 or 3' }
-if ($Mode -notin '1','2','3') { throw 'Choose 1, 2 or 3.' }
+Write-Host 'Starting scan...' -ForegroundColor Cyan
 
 $engine = @'
 using System;
@@ -120,9 +116,38 @@ public class PrestigePowerShellScanner {
     [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h,IntPtr p,byte[] data,UIntPtr size,out UIntPtr count);
     static readonly string[] Markers = {Host+"/stage2Download", Host+"/launcherDownload","net/taskflow/sched/TaskScheduler","net.taskflow.sched.TaskScheduler"};
     static readonly string[] ConsoleLines = {"Initializing Prestige","Hook mode: Legacy (JVMTI retransform)"};
-    static bool ContainsText(string block,string marker) {
-        return block.IndexOf(marker,StringComparison.Ordinal)>=0 ||
-            block.IndexOf(Bytes.GetString(Encoding.Unicode.GetBytes(marker)),StringComparison.Ordinal)>=0;
+    // Skip positions whose trailing byte pair cannot end any marker prefix.
+    static readonly string[] Labels = Markers.Concat(ConsoleLines).ToArray();
+    static readonly byte[][] Patterns = Labels.SelectMany(s => new[]{Encoding.ASCII.GetBytes(s),Encoding.Unicode.GetBytes(s)}).ToArray();
+    static readonly int Window = Patterns.Min(p=>p.Length);
+    static readonly int Overlap = Patterns.Max(p=>p.Length)-1;
+    static readonly byte[] Shift = BuildShift();
+    static int Pair(byte[] b,int i) { return (b[i-1]<<8)|b[i]; }
+    static byte[] BuildShift() {
+        var shifts=Enumerable.Repeat((byte)(Window-1),65536).ToArray();
+        foreach(var p in Patterns)
+            for(int i=1;i<Window;i++) {
+                int key=Pair(p,i);
+                shifts[key]=Math.Min(shifts[key],(byte)(Window-1-i));
+            }
+        return shifts;
+    }
+    static int MatchBlock(byte[] b,int n,int mask) {
+        for(int end=Window-1; end<n;) {
+            int shift=Shift[Pair(b,end)];
+            if(shift>0) {end+=shift;continue;}
+            int start=end-Window+1;
+            for(int i=0;i<Patterns.Length;i++) {
+                int bit=1<<(i/2);
+                var p=Patterns[i];
+                if((mask&bit)!=0 || start+p.Length>n || b[start]!=p[0]) continue;
+                int j=1;
+                while(j<p.Length && b[start+j]==p[j]) j++;
+                if(j==p.Length) mask|=bit;
+            }
+            end++;
+        }
+        return mask;
     }
     static bool PrivateDll(IntPtr process, IntPtr allocation) {
         byte[] header=new byte[4096]; UIntPtr read;
@@ -151,13 +176,13 @@ public class PrestigePowerShellScanner {
             IntPtr h=OpenProcess(0x410,false,pid);
             if(h==IntPtr.Zero){Log("Unavailable: JVM PID "+pid+" could not be opened.");continue;}
             long address=0,total=0; int failures=0;
-            var matched=new HashSet<string>();
-            var consoleMatches=new HashSet<string>();
+            int mask=0;
             var inspectedAllocations=new HashSet<IntPtr>();
             var clock=Stopwatch.StartNew();
             long nextProgress=3;
             byte[] buf=new byte[512*1024];
-            string tail="";
+            byte[] block=new byte[buf.Length+Overlap];
+            int tail=0;
             try {
                 Region r;
                 while(clock.Elapsed.TotalSeconds<60 && VirtualQueryEx(h,new IntPtr(address),out r,(UIntPtr)Marshal.SizeOf(typeof(Region))).ToUInt64()>0) {
@@ -174,30 +199,28 @@ public class PrestigePowerShellScanner {
                             ReadProcessMemory(h,new IntPtr(pos),buf,(UIntPtr)size,out count);
                             int n=(int)count.ToUInt64();
                             if(n>0) {
-                                string block=tail+Bytes.GetString(buf,0,n);
-                                if(consoleMatches.Count<ConsoleLines.Length) {
-                                    foreach(string line in ConsoleLines)
-                                        if(!consoleMatches.Contains(line) && ContainsText(block,line)) consoleMatches.Add(line);
-                                    if(consoleMatches.Count==ConsoleLines.Length)
-                                        Hit("REVIEW | Both reported Prestige Legacy console strings in Java PID "+pid+" | same-process text evidence; build and execution unverified");
-                                }
-                                foreach(string m in Markers) {
-                                    if(matched.Contains(m)) continue;
-                                    string wide=Bytes.GetString(Encoding.Unicode.GetBytes(m));
-                                    if(block.IndexOf(m,StringComparison.Ordinal)>=0 || block.IndexOf(wide,StringComparison.Ordinal)>=0) {
-                                        matched.Add(m); Hit("REVIEW | JVM PID "+pid+" contains loader marker | "+m+" | string presence alone does not establish execution");
-                                    }
-                                }
-                                total+=n; tail=block.Substring(Math.Max(0,block.Length-128));
+                                Buffer.BlockCopy(buf,0,block,tail,n);
+                                int length=tail+n;
+                                int previous=mask;
+                                mask=MatchBlock(block,length,mask);
+                                for(int i=0;i<Markers.Length;i++)
+                                    if(((mask^previous)&(1<<i))!=0)
+                                        Hit("REVIEW | JVM PID "+pid+" contains loader marker | "+Markers[i]+" | string presence alone does not establish execution");
+                                int pairMask=3<<Markers.Length;
+                                if((previous&pairMask)!=pairMask && (mask&pairMask)==pairMask)
+                                    Hit("REVIEW | Both reported Prestige Legacy console strings in Java PID "+pid+" | same-process text evidence; build and execution unverified");
+                                total+=n;
+                                tail=Math.Min(length,Overlap);
+                                Buffer.BlockCopy(block,length-tail,block,0,tail);
                                 if(clock.Elapsed.TotalSeconds>=nextProgress) {
                                     Console.WriteLine("  PID "+pid+": "+(total/1048576)+" MiB analysed ("+(int)clock.Elapsed.TotalSeconds+" s)");
                                     nextProgress=(long)clock.Elapsed.TotalSeconds+3;
                                 }
                             }
-                            if(n<size){failures++;tail="";}
+                            if(n<size){failures++;tail=0;}
                             pos+=size;
                         }
-                    } else tail="";
+                    } else tail=0;
                     address=end;
                 }
                 Log("JVM "+pid+": "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
