@@ -38,7 +38,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV5 {
+public class PrestigeConsoleScannerV7 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -99,11 +99,13 @@ public class PrestigeConsoleScannerV5 {
             }
         }
     }
+    static readonly string[] Apis={"java/lang/ClassLoader","defineClass","javax/crypto/Cipher","java/net/","java/lang/reflect/","loadLibrary"};
     static string JarFileIndicator(string path) {
         if(LoaderStructure(path)) return "Known loader manifest and class structure";
         // Inspect bounded, decompressed class data. Treat strings as supporting evidence only.
         using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read)) {
-            int budget=4*1024*1024;
+            int budget=4*1024*1024; int traits=0;
+            bool blob=z.Entries.Any(e=>e.Length>=256 && Regex.IsMatch(e.FullName,@"\.(enc|bin|dat)$",RegexOptions.IgnoreCase));
             byte[] block=new byte[65536+Overlap], chunk=new byte[65536];
             foreach(var entry in z.Entries) {
                 if(!entry.FullName.EndsWith(".class",StringComparison.OrdinalIgnoreCase) || entry.Length<4) continue;
@@ -114,6 +116,8 @@ public class PrestigeConsoleScannerV5 {
                         if(n==0)break;
                         Buffer.BlockCopy(chunk,0,block,carry,n); int length=carry+n;
                         mask=MatchBlock(block,length,mask);budget-=n;
+                        string literals=Bytes.GetString(block,0,length);
+                        for(int t=0;t<Apis.Length;t++) if(literals.IndexOf(Apis[t],StringComparison.Ordinal)>=0)traits|=1<<t;
                         if((mask&3)!=0) return "Prestige loader endpoint in "+entry.FullName;
                         int pair=3<<Markers.Length;
                         if((mask&pair)==pair) return "Paired Prestige console strings in "+entry.FullName;
@@ -122,11 +126,26 @@ public class PrestigeConsoleScannerV5 {
                 }
                 if(budget==0)break;
             }
+            if((traits&31)==31) return "GENERIC: class-definition, encryption, network and reflection API references"+((traits&32)!=0?"; native loading API":"")+(blob?"; binary resource present":"");
         }
         return null;
     }
+    // Only learn class fingerprints from an archive whose full SHA-256 matches the verified loader.
+    static readonly HashSet<string> RefClasses=new HashSet<string>();
+    static HashSet<string> ClassHashes(string path) {
+        var hashes=new HashSet<string>(); long remaining=4*1024*1024;
+        using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read))
+        using(var sha=SHA256.Create()) foreach(var e in z.Entries) {
+            if(!e.FullName.EndsWith(".class",StringComparison.OrdinalIgnoreCase)||e.Length<64 || e.Length>remaining)continue;
+            remaining-=e.Length;
+            using(var st=e.Open())hashes.Add(BitConverter.ToString(sha.ComputeHash(st)));
+            if(remaining<=0)break;
+        }
+        return hashes;
+    }
     static void Disk(string[] roots) {
         int files=0, hashes=0, errors=0, links=0;
+        RefClasses.Clear(); var jarCandidates=new List<string>();
         var pending=new Stack<string>(roots);
         var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         while(pending.Count>0 && files<250000) {
@@ -146,15 +165,22 @@ public class PrestigeConsoleScannerV5 {
                     using(var f=File.OpenRead(path)) using(var sha=SHA256.Create()) {
                         string h=BitConverter.ToString(sha.ComputeHash(f)).Replace("-","").ToLowerInvariant();
                         string sample=Sample(h);
-                        if(sample!=null){Hit("EXACT | "+sample+" on disk | "+path+" | "+h);continue;}
+                        if(sample!=null){if(h.Equals(Jar,StringComparison.OrdinalIgnoreCase))RefClasses.UnionWith(ClassHashes(path));Hit("EXACT | "+sample+" on disk | "+path+" | "+h);continue;}
                     }
                 }
                 if(path.EndsWith(".jar",StringComparison.OrdinalIgnoreCase) && length<=4*1024*1024 && length>0) {
-                    try { string reason=JarFileIndicator(path); if(reason!=null)Hit("FILE INDICATOR | "+reason+" | "+path); }
+                    if(length<=128*1024 && jarCandidates.Count<2048)jarCandidates.Add(path);
+                    try { string reason=JarFileIndicator(path); if(reason!=null)Hit((reason.StartsWith("GENERIC:")?"GENERIC | ":"FILE INDICATOR | ")+reason+" | "+path); }
                     catch(InvalidDataException){errors++;}
                 }
             } catch(UnauthorizedAccessException){errors++;} catch(IOException){errors++;}
         }
+        if(RefClasses.Count>=2) foreach(var path in jarCandidates) {
+            try {int shared=ClassHashes(path).Count(RefClasses.Contains);
+                if(shared>=2)Hit("FILE INDICATOR | "+shared+" identical class files shared with verified JAR loader | "+path);
+            }catch(InvalidDataException){errors++;}catch(IOException){errors++;}catch(UnauthorizedAccessException){errors++;}
+        }
+        Log("Reference class fingerprints available: "+RefClasses.Count+"; small repack candidates retained: "+jarCandidates.Count+" (limit 2048)");
         Log("Disk coverage: "+files+" files inspected; "+hashes+" size candidates hashed; "+errors+" unavailable; "+links+" links skipped; scan limit reached: "+(pending.Count>0));
     }
     [StructLayout(LayoutKind.Sequential)] struct Region {
@@ -229,7 +255,11 @@ public class PrestigeConsoleScannerV5 {
             catch(InvalidOperationException){Log("PID "+pid+" exited.");continue;}
             IntPtr h=OpenProcess(0x410,false,pid);
             if(h==IntPtr.Zero){Log("Unavailable: JVM PID "+pid+" could not be opened.");continue;}
-            long address=0,total=0; int failures=0;
+            var moduleNames=new Dictionary<IntPtr,string>();var privateImages=new HashSet<IntPtr>();
+            if(gamePids.Contains(pid)) try { foreach(ProcessModule module in p.Modules) using(module) moduleNames[module.BaseAddress]=module.ModuleName; }
+            catch(System.ComponentModel.Win32Exception){Log("Coverage incomplete: native module enumeration PID "+pid);}
+            catch(InvalidOperationException){Log("Coverage incomplete: process exited during module enumeration");}
+            long address=0,total=0; IntPtr allocation=IntPtr.Zero;int localMask=0; int failures=0;
             int mask=0;
             var inspectedAllocations=new HashSet<IntPtr>();
             var clock=Stopwatch.StartNew();
@@ -242,10 +272,11 @@ public class PrestigeConsoleScannerV5 {
                 while(clock.Elapsed.TotalSeconds<60 && VirtualQueryEx(h,new IntPtr(address),out r,(UIntPtr)Marshal.SizeOf(typeof(Region))).ToUInt64()>0) {
                     long end=checked(r.Base.ToInt64()+(long)r.Size.ToUInt64());
                     if(end<=address) break;
+                    if(allocation!=r.AllocationBase){allocation=r.AllocationBase;localMask=0;tail=0;}
                     uint perm=r.Protect & 255;
                     if(r.State==0x1000 && r.Type==0x20000 && (r.Protect&256)==0 && perm>=16 &&
                         inspectedAllocations.Add(r.AllocationBase) && PrivateDll(h,r.AllocationBase))
-                        Hit("GENERIC | Private allocation with executable protection and DLL headers | PID "+pid+" | allocation 0x"+r.AllocationBase.ToInt64().ToString("X")+" | possible manual map; payload identity unknown");
+                        { privateImages.Add(allocation); Hit("GENERIC | Private allocation with executable protection and DLL headers | PID "+pid+" | allocation 0x"+r.AllocationBase.ToInt64().ToString("X")+" | possible manual map; payload identity unknown"); }
                     if(r.State==0x1000 && (r.Protect&256)==0 && (perm==2||perm==4||perm==8||perm==32||perm==64||perm==128)) {
                         for(long pos=address;pos<end && clock.Elapsed.TotalSeconds<60;) {
                             int size=(int)Math.Min(buf.Length,end-pos);
@@ -256,7 +287,16 @@ public class PrestigeConsoleScannerV5 {
                                 Buffer.BlockCopy(buf,0,block,tail,n);
                                 int length=tail+n;
                                 int previous=mask;
-                                mask=MatchBlock(block,length,mask);
+                                int priorLocal=localMask;
+                                localMask=MatchBlock(block,length,localMask);
+                                mask|=localMask;
+                                string moduleName;
+                                if(gamePids.Contains(pid) && localMask!=priorLocal && (moduleNames.TryGetValue(allocation,out moduleName)||privateImages.Contains(allocation))) {
+                                    int pair=3<<Markers.Length;
+                                    bool strong=((localMask^priorLocal)&3)!=0 || ((localMask&pair)==pair && (priorLocal&pair)!=pair);
+                                    if(strong || ((localMask^priorLocal)&HostBit)!=0)
+                                        Hit((strong?"LINKED":"REVIEW")+" | Minecraft PID "+pid+" | "+(strong?"Prestige loader markers":"Prestige hostname")+" in "+(moduleName??"private DLL-like memory")+" at 0x"+allocation.ToInt64().ToString("X"));
+                                }
                                 for(int i=0;i<Markers.Length;i++)
                                     if(((mask^previous)&(1<<i))!=0)
                                         Hit("REVIEW | JVM PID "+pid+" contains loader marker | "+Markers[i]+" | string presence alone does not establish execution");
@@ -341,6 +381,8 @@ public class PrestigeConsoleScannerV5 {
     static void Events() {
         const string channel="Microsoft-Windows-Sysmon/Operational";
         var known=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var apiQueries=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
+        var remoteThreads=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
         // First pass establishes identity, irrespective of how recently a later event was written.
         foreach(var ids in new[]{new[]{1},new[]{8,22,23,26}}) {
             string query="*[System[("+String.Join(" or ",ids.Select(i=>"EventID="+i))+") and TimeCreated[timediff(@SystemTime) <= 604800000]]]";
@@ -368,6 +410,21 @@ public class PrestigeConsoleScannerV5 {
                             GameStarts.TryGetValue(queryPid,out started) && e.TimeCreated.HasValue &&
                             e.TimeCreated.Value.ToUniversalTime()>=started && SameLiveProcess(queryPid,started);
                         Hit("REVIEW | "+(current?"Running Minecraft session":"Process")+" queried Prestige API | "+v("Image")+" PID "+v("ProcessId")+where);
+                    }
+                    if(e.TimeCreated.HasValue) {
+                        bool dns=e.Id==22 && Java(v("Image")) && String.Equals(v("QueryName").TrimEnd('.'),Host,StringComparison.OrdinalIgnoreCase);
+                        bool thread=e.Id==8 && Java(v("TargetImage"));
+                        if(dns || thread) {
+                            string guid=dns?id:v("TargetProcessGuid"); DateTime other;
+                            if(!String.IsNullOrEmpty(guid)) {
+                                var currentMap=dns?apiQueries:remoteThreads;
+                                var otherMap=dns?remoteThreads:apiQueries;
+                                var time=e.TimeCreated.Value.ToUniversalTime();
+                                if(otherMap.TryGetValue(guid,out other) && Math.Abs((time-other).TotalMinutes)<=5)
+                                    Hit("LINKED | Remote thread and Prestige API DNS query within five minutes in the same Java process | "+guid+" | events at "+other.ToString("u")+" and "+time.ToString("u")+" | attribution requires review");
+                                currentMap[guid]=time;
+                            }
+                        }
                     }
                     if(e.Id==8 && Java(v("TargetImage"))) {
                         bool linked=known.Contains(v("SourceProcessGuid"));
@@ -451,7 +508,7 @@ public class PrestigeConsoleScannerV5 {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
         try {action();} catch(Exception e){Log("Coverage incomplete: "+e.Message);}
     }
-    public static int Scan(string[] args,string outputDir,int[] minecraftIds) { Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
+    public static int Scan(string[] args,string outputDir,int[] minecraftIds,string[] extra) { Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
@@ -460,6 +517,9 @@ public class PrestigeConsoleScannerV5 {
                 report.AutoFlush=true;
                 Log("Prestige Scanner | UTC "+DateTime.UtcNow.ToString("u")+" | mode "+mode);
                 Log("EXACT = known loader bytes/hash; LINKED = attributed event; REVIEW/GENERIC = lead. No match cannot clear a player.");
+                foreach(string line in extra) {
+                    if(line.StartsWith("EXACT |")||line.StartsWith("GENERIC |")||line.StartsWith("REVIEW |"))Hit(line);else Log(line);
+                }
                 if(mode!="2") Run("Live Java memory",Memory);
                 if(mode!="1") {
                     string user=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -480,22 +540,110 @@ public class PrestigeConsoleScannerV5 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV5' -as [type])) {
+if (!('PrestigeConsoleScannerV7' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
+function Get-GameDiagnostics($row) {
+    $gameId = [int]$row.ProcessId
+    $cmd = [string]$row.CommandLine
+    foreach ($flag in '-javaagent:', '-agentpath:', '-agentlib:') {
+        if ($cmd.IndexOf($flag,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            "GENERIC | Minecraft PID $gameId has JVM option $flag (legitimate agents also use this)"
+        }
+    }
+    foreach ($match in [regex]::Matches($cmd,'(?i)(?:^|\s)"?-(?:javaagent:|jar\s+"?)([A-Z]:[^"\r\n]*?\.jar)(?=["=\s]|$)')) {
+        $file = $match.Groups[1].Value
+        try {
+            if ((Get-Item -LiteralPath $file).Length -eq 8119 -and (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -eq 'c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1') {
+                "EXACT | Minecraft PID $gameId launch argument references a file currently matching the known JAR loader | $file"
+            }
+        } catch { "Coverage incomplete: launch-argument JAR unavailable for PID $gameId" }
+    }
+    # Use only the target runtime's installed, signed JDK diagnostic tool.
+    $image = [string]$row.ExecutablePath
+    $programs = [Environment]::GetFolderPath('ProgramFiles') + '\'
+    if (!$image.StartsWith($programs,[StringComparison]::OrdinalIgnoreCase)) {
+        "Coverage incomplete: class diagnostics require a matching signed JDK under Program Files for PID $gameId"
+        return
+    }
+    $tool = Join-Path (Split-Path -Parent $image) 'jcmd.exe'
+    if (!(Test-Path -LiteralPath $tool -PathType Leaf) -or (Get-AuthenticodeSignature -LiteralPath $tool).Status -ne 'Valid') {
+        "Coverage incomplete: signed jcmd unavailable for PID $gameId"
+        return
+    }
+    foreach ($query in 'VM.classloaders','VM.class_hierarchy net.taskflow.sched.TaskScheduler') {
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=$tool
+        $info.Arguments="$gameId $query"
+        $info.WorkingDirectory=Split-Path -Parent $tool
+        $info.UseShellExecute=$false
+        $info.CreateNoWindow=$true
+        $info.RedirectStandardOutput=$true
+        $info.RedirectStandardError=$true
+        foreach ($key in 'JAVA_TOOL_OPTIONS','_JAVA_OPTIONS','JDK_JAVA_OPTIONS','CLASSPATH') { $info.EnvironmentVariables.Remove($key) }
+        $proc=[Diagnostics.Process]::Start($info)
+        try {
+            $stdout=$proc.StandardOutput.ReadToEndAsync()
+            $stderr=$proc.StandardError.ReadToEndAsync()
+            if (!$proc.WaitForExit(8000)) {
+                try { $proc.Kill() } catch {}
+                "Coverage incomplete: Java diagnostic timed out for PID $gameId"
+                return
+            }
+            $data=$stdout.GetAwaiter().GetResult()
+            if($proc.ExitCode -ne 0 -or $data -match '(?i)unknown diagnostic command|diagnosticcommandexception') { "Coverage incomplete: $query unavailable in PID $gameId"; continue }
+            if($data -match '(?im)^\s*(?:[|+\- ]*)net[./]taskflow[./]sched[./]TaskScheduler(?:[/@$\s]|$)') {
+                "REVIEW | Live JVM class or class loader matching the reference TaskScheduler name | PID $gameId | $query"
+            } else { "Java diagnostics | PID $gameId | checked $query" }
+        } finally {$proc.Dispose()}
+    }
+}
+function Get-HistoricalIndicators {
+    $names='(?i)icloudjsclownht2ogv\.exe|lesqid is gay\.jar|taskflow-2\.5\.15\.jar'
+    $key='Registry::HKEY_LOCAL_MACHINE\Amcache\Root\InventoryApplicationFile'
+    if(Test-Path -LiteralPath $key) {
+        $items=@(Get-ChildItem -LiteralPath $key -ErrorAction Stop | Select-Object -First 20000)
+        foreach($item in $items) {
+            $path=[string]$item.GetValue('LowerCaseLongPath')
+            if($path -match $names) {"REVIEW | Mounted Amcache inventory filename | $path"}
+        }
+        "Amcache inventory entries checked: $($items.Count) (limit 20000)"
+    } else { 'Coverage incomplete: mounted Amcache inventory unavailable' }
+    $cache=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction SilentlyContinue
+    if($cache -and $cache.AppCompatCache -is [byte[]]) {
+        $text=[Text.Encoding]::Unicode.GetString($cache.AppCompatCache)
+        foreach($hit in [regex]::Matches($text,$names) | Select-Object -First 10) { "REVIEW | ShimCache filename string | $($hit.Value) | inventory lead only" }
+    } else { 'Coverage incomplete: ShimCache value unavailable' }
+    $log=Join-Path $env:APPDATA '.minecraft\logs\latest.log'
+    if(Test-Path -LiteralPath $log) {
+        $found=Get-Content -LiteralPath $log -Tail 10000 | Select-String -Pattern 'api\.prestigeclient\.vip|net[./]taskflow[./]sched[./]TaskScheduler' | Select-Object -First 1
+        if($found){'REVIEW | Minecraft latest.log contains a known hostname or loader class name (chat and mod logs can contain text)'}
+    }
+    foreach($entry in @(@('Security',1102),@('System',104))) {
+        try {
+            $events=Get-WinEvent -FilterHashtable @{LogName=$entry[0];Id=$entry[1];StartTime=(Get-Date).AddDays(-7)} -MaxEvents 50 -ErrorAction Stop
+            foreach($ev in $events){ if($entry[1] -eq 104 -and $ev.ProviderName -ne 'Microsoft-Windows-Eventlog'){continue}; "GENERIC | Windows log-clearing event | $($entry[0]) record $($ev.RecordId) | $($ev.TimeCreated.ToUniversalTime().ToString('u')) | cause unknown" }
+        } catch { if($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*'){"Coverage incomplete: $($entry[0]) log-clear history unavailable"} }
+    }
+}
+
 $minecraftIds = @()
+$extra = New-Object 'System.Collections.Generic.List[string]'
 if ($Mode -ne '2') {
     try {
-        $java = Get-CimInstance Win32_Process -Filter "Name='javaw.exe' OR Name='java.exe'" -Property ProcessId,CommandLine -ErrorAction Stop
+        $java = Get-CimInstance Win32_Process -Filter "Name='javaw.exe' OR Name='java.exe'" -Property ProcessId,CommandLine,ExecutablePath -ErrorAction Stop
         $clientEntry = '(?i)(?:^|\s|")(?:net\.minecraft\.client\.main\.Main|(?:net\.fabricmc\.loader(?:\.impl)?|org\.quiltmc\.loader\.impl)\.launch\.knot\.KnotClient)(?=\s|"|$)'
         $minecraftIds = @($java | Where-Object {
             $_.CommandLine -match $clientEntry -or
             $_.CommandLine -match '(?i)--launchTarget(?:\s+|=)"?(?:forgeclient|neoforgeclient|fmlclient)(?:\s|"|$)' -or
             ($_.CommandLine -match '(?i)--gameDir\b' -and $_.CommandLine -match '(?i)--assetsDir\b' -and $_.CommandLine -match '(?i)--assetIndex\b')
-        } | ForEach-Object { [int]$_.ProcessId })
+        } | ForEach-Object { $row=$_; try { foreach ($line in @(Get-GameDiagnostics $row)) {$extra.Add([string]$line)} } catch {$extra.Add("Coverage incomplete: Java diagnostic unavailable for PID $($row.ProcessId)")} ; [int]$row.ProcessId })
     } catch { Write-Host 'Minecraft identification unavailable. Checking all Java processes.' -ForegroundColor Yellow }
     if (!$minecraftIds.Count) { Write-Host 'No Minecraft client identified by launch arguments. Checking all Java processes.' -ForegroundColor Yellow }
 }
-$status = [PrestigeConsoleScannerV5]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds)
+if ($Mode -ne '1') {
+    try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
+}
+$status = [PrestigeConsoleScannerV7]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
