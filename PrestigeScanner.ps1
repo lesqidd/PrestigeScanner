@@ -14,11 +14,6 @@ if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) {
     throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
 }
-$outputFolder = $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($outputFolder)) {
-    $outputFolder = [Environment]::GetFolderPath('MyDocuments')
-    if ([string]::IsNullOrWhiteSpace($outputFolder)) { $outputFolder = $env:TEMP }
-}
 
 Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
 Write-Host 'Starting scan...' -ForegroundColor Cyan
@@ -38,7 +33,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV8 {
+public class PrestigeConsoleScannerV9 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -46,7 +41,6 @@ public class PrestigeConsoleScannerV8 {
     const string OriginalJar = "lesqid is gay.jar";
     static readonly Encoding Bytes = Encoding.GetEncoding(28591);
     static readonly HashSet<string> Findings = new HashSet<string>();
-    static StreamWriter report;
     static HashSet<int> gamePids=new HashSet<int>();
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int handle);
     [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
@@ -63,7 +57,6 @@ public class PrestigeConsoleScannerV8 {
         } finally {Console.BackgroundColor=bg;Console.ForegroundColor=fg;}
     }
     static void Log(string s) {
-        report.WriteLine(s);
         if(s.StartsWith("Coverage incomplete")||s.StartsWith("Unavailable:")){gaps++;return;}
         if(s.StartsWith("MINECRAFT CLIENT | scanning")){Paint(s.Replace("MINECRAFT CLIENT | scanning live PID","Scanning Minecraft PID"),ConsoleColor.Cyan);return;}
         if(s.StartsWith("Live Java processes: 0")){Paint("No running Java process found.",ConsoleColor.Yellow);return;}
@@ -78,8 +71,8 @@ public class PrestigeConsoleScannerV8 {
         }
         if(s.StartsWith("Distinct findings:")){
             Paint("Scan complete",ConsoleColor.Cyan);
-            if(shown==0) Paint("No priority matches surfaced. See the report for other leads.",ConsoleColor.Gray);
-            if(gaps>0) Paint("Some checks were unavailable. See report for details.",ConsoleColor.Yellow);
+            if(shown==0) Paint("No priority matches surfaced.",ConsoleColor.Gray);
+            if(gaps>0) Paint("Some checks were unavailable.",ConsoleColor.Yellow);
         }
     }
     static void Hit(string s) { if (Findings.Add(s)) Log(s); }
@@ -519,32 +512,27 @@ public class PrestigeConsoleScannerV8 {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
         try {action();} catch(Exception e){Log("Coverage incomplete: "+e.Message);}
     }
-    public static int Scan(string[] args,string outputDir,int[] minecraftIds,string[] extra) { gaps=0; shown=0; Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
+    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { gaps=0; shown=0; Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
-            string output=Path.Combine(outputDir,"Prestige-report-"+DateTime.UtcNow.ToString("yyyyMMdd-HHmmss")+"-"+Guid.NewGuid().ToString("N").Substring(0,6)+".txt");
-            using(report=new StreamWriter(new FileStream(output,FileMode.CreateNew,FileAccess.Write,FileShare.Read))) {
-                report.AutoFlush=true;
-                Log("Prestige Scanner | UTC "+DateTime.UtcNow.ToString("u")+" | mode "+mode);
-                Log("EXACT = known loader bytes/hash; LINKED = attributed event; REVIEW/GENERIC = lead. No match cannot clear a player.");
-                foreach(string line in extra) {
-                    if(line.StartsWith("EXACT |")||line.StartsWith("GENERIC |")||line.StartsWith("REVIEW |"))Hit(line);else Log(line);
-                }
-                if(mode!="2") Run("Live Java memory",Memory);
-                if(mode!="1") {
-                    string user=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                    string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
-                    Paint("Checking files and history...",ConsoleColor.Cyan);
-                    Run(null,delegate {Disk(roots);});
-                    Run("Prefetch",Prefetch); Run("Event history",Events);
-                    Run("PowerShell and Win+R history",History);
-                    foreach(string channel in new[]{"Microsoft-Windows-PowerShell/Operational","PowerShellCore/Operational","Security"})
-                        Run(channel,delegate {ShellLog(channel,channel=="Security"?4688:4104);});
-                }
-                Log("Distinct findings: "+Findings.Count+". Deletion alone does not establish self-destruction. A JVM may belong to another application.");
+            Log("Prestige Scanner | UTC "+DateTime.UtcNow.ToString("u")+" | mode "+mode);
+            Log("EXACT = known loader bytes/hash; LINKED = attributed event; REVIEW/GENERIC = lead. No match cannot clear a player.");
+            foreach(string line in extra) {
+                if(line.StartsWith("EXACT |")||line.StartsWith("GENERIC |")||line.StartsWith("REVIEW |"))Hit(line);else Log(line);
             }
-            Console.WriteLine("Report: "+output);
+            if(mode!="2") Run("Live Java memory",Memory);
+            if(mode!="1") {
+                string user=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
+                Paint("Checking files and history...",ConsoleColor.Cyan);
+                Run(null,delegate {Disk(roots);});
+                Run("Prefetch",Prefetch); Run("Event history",Events);
+                Run("PowerShell and Win+R history",History);
+                foreach(string channel in new[]{"Microsoft-Windows-PowerShell/Operational","PowerShellCore/Operational","Security"})
+                    Run(channel,delegate {ShellLog(channel,channel=="Security"?4688:4104);});
+            }
+            Log("Distinct findings: "+Findings.Count+". Deletion alone does not establish self-destruction. A JVM may belong to another application.");
             if(args.Length==0){Console.WriteLine("Press Enter to close.");Console.ReadLine();}
             return 0;
         } catch(Exception e){Console.Error.WriteLine(e.Message);return 1;}
@@ -552,7 +540,7 @@ public class PrestigeConsoleScannerV8 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV8' -as [type])) {
+if (!('PrestigeConsoleScannerV9' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Get-GameDiagnostics($row) {
@@ -656,6 +644,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV8]::Scan([string[]]@($Mode), $outputFolder, [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV9]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
