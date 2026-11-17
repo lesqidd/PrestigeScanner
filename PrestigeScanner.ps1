@@ -34,7 +34,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV11 {
+public class PrestigeConsoleScannerV12 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -84,7 +84,7 @@ public class PrestigeConsoleScannerV11 {
         if(s.StartsWith("Distinct findings:")){
             Paint("Scan complete",ConsoleColor.Cyan);
             if(shown==0) Paint("No priority matches surfaced.",ConsoleColor.Gray);
-            if(skipped.Count>0) Paint("Skipped: "+String.Join(", ",skipped),ConsoleColor.DarkGray);
+            if(skipped.Count>0) Paint("Unavailable: "+String.Join(", ",skipped),ConsoleColor.DarkGray);
         }
     }
     static void Hit(string s) { lock(OutputLock) if (Findings.Add(s)) LogLine(s); }
@@ -444,15 +444,14 @@ public class PrestigeConsoleScannerV11 {
         try {using(var p=Process.GetProcessById(pid)) return p.StartTime.ToUniversalTime()==start;}
         catch(ArgumentException){return false;} catch(InvalidOperationException){return false;} catch(System.ComponentModel.Win32Exception){return false;}
     }
-    static void Events() {
-        const string channel="Microsoft-Windows-Sysmon/Operational";
+    static void Events(string channel,PathType kindOfPath) {
         var known=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var apiQueries=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
         var remoteThreads=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
         // First pass establishes identity, irrespective of how recently a later event was written.
         foreach(var ids in new[]{new[]{1},new[]{8,22,23,26}}) {
             string query="*[System[("+String.Join(" or ",ids.Select(i=>"EventID="+i))+") and TimeCreated[timediff(@SystemTime) <= 604800000]]]";
-            var q=new EventLogQuery(channel,PathType.LogName,query){ReverseDirection=true};
+            var q=new EventLogQuery(channel,kindOfPath,query){ReverseDirection=true};
             int records=0;
             using(var reader=new EventLogReader(q)) {
                 EventRecord e;
@@ -560,9 +559,28 @@ public class PrestigeConsoleScannerV11 {
             foreach(string name in key.GetValueNames()) if(name.Length==1) CheckCommand(key.GetValue(name) as string,"Current user Win+R history, entry "+name+" (undated)");
         }
     }
+    static void ReadAmcacheHive(string path) {
+        using(var f=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)) {
+            if(f.ReadByte()!=114 || f.ReadByte()!=101 || f.ReadByte()!=103 || f.ReadByte()!=102)throw new InvalidDataException("Invalid hive header");
+            string[] names={OriginalExe,OriginalJar,"taskflow-2.5.15.jar"};
+            byte[] data=new byte[65536+256];int carry=0,n;
+            while((n=f.Read(data,carry,65536))>0){
+                int length=carry+n;
+                for(int offset=0;offset<=1;offset++){
+                    string view=Encoding.Unicode.GetString(data,offset,(length-offset)&~1);
+                    foreach(string name in names)if(view.IndexOf(name,StringComparison.OrdinalIgnoreCase)>=0)
+                        Hit("REVIEW | Amcache hive filename string | "+name+" | inventory lead only");
+                }
+                carry=Math.Min(256,length);Buffer.BlockCopy(data,length-carry,data,0,carry);
+            }
+        }
+    }
     static void Amcache() {
-        using(var root=Registry.LocalMachine.OpenSubKey(@"Amcache\Root\InventoryApplicationFile")) {
-            if(root==null){Log("Coverage incomplete: mounted Amcache inventory unavailable");return;}
+        RegistryKey inventory=null;
+        try {inventory=Registry.LocalMachine.OpenSubKey(@"Amcache\Root\InventoryApplicationFile");}
+        catch(UnauthorizedAccessException){} catch(System.Security.SecurityException){}
+        using(var root=inventory) {
+            if(root==null){ReadAmcacheHive(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"appcompat","Programs","Amcache.hve"));return;}
             foreach(var name in root.GetSubKeyNames().Take(20000)) using(var item=root.OpenSubKey(name)) {
                 string path=item==null?null:item.GetValue("LowerCaseLongPath") as string;
                 if(path!=null && (Original(path)||path.EndsWith("taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase)))
@@ -570,9 +588,9 @@ public class PrestigeConsoleScannerV11 {
             }
         }
     }
-    static void ShellLog(string channel,int eventId) {
+    static void ShellLog(string channel,int eventId,PathType kindOfPath) {
         string query="*[System[EventID="+eventId+" and TimeCreated[timediff(@SystemTime) <= 604800000]]]";
-        var q=new EventLogQuery(channel,PathType.LogName,query){ReverseDirection=true};
+        var q=new EventLogQuery(channel,kindOfPath,query){ReverseDirection=true};
         int count=0;
         using(var reader=new EventLogReader(q)) {
             EventRecord e;
@@ -585,6 +603,21 @@ public class PrestigeConsoleScannerV11 {
             }
         }
         Log("Records examined: "+count+" (7 days; limit 50000; split script blocks assessed individually)");
+    }
+    static void WithEventFallback(string channel,Action<string,PathType> scan) {
+        try {scan(channel,PathType.LogName);return;}
+        catch(EventLogException){} catch(UnauthorizedAccessException){} catch(System.Security.SecurityException){}
+        string dir=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"System32","winevt","Logs");
+        string stem=channel.Replace("/","%4");
+        var paths=new List<string>{Path.Combine(dir,stem+".evtx")};
+        paths.AddRange(Directory.EnumerateFiles(dir,"Archive-"+stem+"-*.evtx").OrderByDescending(File.GetLastWriteTimeUtc).Take(4));
+        bool readable=false;
+        foreach(var path in paths) {
+            if(!File.Exists(path))continue;
+            try {scan(path,PathType.FilePath);readable=true;}
+            catch(EventLogException){} catch(UnauthorizedAccessException){} catch(System.Security.SecurityException){}
+        }
+        if(!readable)throw new IOException("No readable live or archived event log");
     }
     static void Run(string label, Action action) {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
@@ -606,10 +639,10 @@ public class PrestigeConsoleScannerV11 {
                 Paint("Checking files and history...",ConsoleColor.Cyan);
                 var disk=System.Threading.Tasks.Task.Factory.StartNew(delegate {Run(null,delegate {Disk(roots);});}, System.Threading.CancellationToken.None,System.Threading.Tasks.TaskCreationOptions.None,System.Threading.Tasks.TaskScheduler.Default);
                 try {
-                    Run("Amcache",Amcache); Run("Prefetch",Prefetch); Run("Sysmon",Events);
+                    Run("Amcache",Amcache); Run("Prefetch",Prefetch); Run("Sysmon",delegate {WithEventFallback("Microsoft-Windows-Sysmon/Operational",Events);});
                     Run("PowerShell and Win+R history",History);
                     foreach(string channel in new[]{"Microsoft-Windows-PowerShell/Operational","PowerShellCore/Operational","Security"})
-                        Run(channel=="PowerShellCore/Operational"?"PowerShell 7 log":channel=="Security"?"Security log":"Windows PowerShell log",delegate {ShellLog(channel,channel=="Security"?4688:4104);});
+                        Run(channel=="PowerShellCore/Operational"?"PowerShell 7 log":channel=="Security"?"Security log":"Windows PowerShell log",delegate {WithEventFallback(channel,delegate(string src,PathType type){ShellLog(src,channel=="Security"?4688:4104,type);});});
                 } finally {disk.Wait();}
             }
             Log("Distinct findings: "+Findings.Count+". Deletion alone does not establish self-destruction. A JVM may belong to another application.");
@@ -620,8 +653,43 @@ public class PrestigeConsoleScannerV11 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV11' -as [type])) {
+if (!('PrestigeConsoleScannerV12' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
+}
+function Find-JvmDiagnostic([string]$image) {
+    if (!$image -or !(Test-Path -LiteralPath $image -PathType Leaf)) {return}
+    $base=[Environment]::GetFolderPath('ProgramFiles')
+    $targetBin=Split-Path -Parent $image
+    $targetHome=Split-Path -Parent $targetBin
+    $release=Join-Path $targetHome 'release'
+    $major=''
+    if(Test-Path -LiteralPath $release -PathType Leaf) {
+        $versionLine=Get-Content -LiteralPath $release -TotalCount 80 | Where-Object {$_ -match '^JAVA_VERSION='} | Select-Object -First 1
+        if($versionLine -match '^JAVA_VERSION="(?:1\.)?(\d+)'){$major=$Matches[1]}
+    }
+    $choices=@(Join-Path $targetBin 'jcmd.exe')
+    if($major) {
+        foreach($vendor in 'Java','Eclipse Adoptium','Microsoft','Zulu','Amazon Corretto','BellSoft') {
+            $vendorDir=Join-Path $base $vendor
+            if(!(Test-Path -LiteralPath $vendorDir -PathType Container)){continue}
+            foreach($jdk in Get-ChildItem -LiteralPath $vendorDir -Directory -ErrorAction SilentlyContinue) {
+                $choices+=Join-Path $jdk.FullName 'bin\jcmd.exe'
+            }
+        }
+    }
+    foreach($candidate in $choices | Select-Object -Unique) {
+        if(!$candidate.StartsWith($base+'\',[StringComparison]::OrdinalIgnoreCase) -or !(Test-Path -LiteralPath $candidate -PathType Leaf)){continue}
+        $node=Get-Item -LiteralPath $candidate
+        if($node.Attributes -band [IO.FileAttributes]::ReparsePoint){continue}
+        $dir=$node.Directory
+        while($dir -and !($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $dir.FullName -ne $base){$dir=$dir.Parent}
+        if(!$dir -or $dir.FullName -ne $base){continue}
+        if($candidate -ne $choices[0]) {
+            $v=Get-Content -LiteralPath (Join-Path $node.Directory.Parent.FullName 'release') -TotalCount 80 -ErrorAction SilentlyContinue | Where-Object {$_ -match '^JAVA_VERSION='} | Select-Object -First 1
+            if($v -notmatch '^JAVA_VERSION="(?:1\.)?(\d+)' -or $Matches[1] -ne $major){continue}
+        }
+        if((Get-AuthenticodeSignature -LiteralPath $candidate).Status -eq 'Valid'){return $candidate}
+    }
 }
 function Get-GameDiagnostics($row) {
     $gameId = [int]$row.ProcessId
@@ -639,16 +707,10 @@ function Get-GameDiagnostics($row) {
             }
         } catch { "Coverage incomplete: launch-argument JAR unavailable for PID $gameId" }
     }
-    # Use only the target runtime's installed, signed JDK diagnostic tool.
     $image = [string]$row.ExecutablePath
-    $programs = [Environment]::GetFolderPath('ProgramFiles') + '\'
-    if (!$image.StartsWith($programs,[StringComparison]::OrdinalIgnoreCase)) {
-        "Coverage incomplete: class diagnostics require a matching signed JDK under Program Files for PID $gameId"
-        return
-    }
-    $tool = Join-Path (Split-Path -Parent $image) 'jcmd.exe'
-    if (!(Test-Path -LiteralPath $tool -PathType Leaf) -or (Get-AuthenticodeSignature -LiteralPath $tool).Status -ne 'Valid') {
-        "Coverage incomplete: signed jcmd unavailable for PID $gameId"
+    $tool = Find-JvmDiagnostic $image
+    if (!$tool) {
+        "Coverage incomplete: JVM class inspection (no matching local JDK)"
         return
     }
     foreach ($query in 'VM.classloaders','VM.class_hierarchy net.taskflow.sched.TaskScheduler') {
@@ -715,6 +777,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV11]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV12]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
