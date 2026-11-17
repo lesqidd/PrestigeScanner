@@ -34,7 +34,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV10 {
+public class PrestigeConsoleScannerV11 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -66,7 +66,9 @@ public class PrestigeConsoleScannerV10 {
             else Console.WriteLine(text);
         } finally {Console.BackgroundColor=bg;Console.ForegroundColor=fg;}
     }
-    static void Log(string s) {
+    static readonly object OutputLock=new object();
+    static void Log(string s) { lock(OutputLock) LogLine(s); }
+    static void LogLine(string s) {
         if(s.StartsWith("Coverage incomplete")||s.StartsWith("Unavailable:")){skipped.Add(ShortCheck(s));return;}
         if(s.StartsWith("MINECRAFT CLIENT | scanning")){Paint(s.Replace("MINECRAFT CLIENT | scanning live PID","Scanning Minecraft PID"),ConsoleColor.Cyan);return;}
         if(s.StartsWith("Live Java processes: 0")){Paint("No running Java process found.",ConsoleColor.Yellow);return;}
@@ -85,7 +87,7 @@ public class PrestigeConsoleScannerV10 {
             if(skipped.Count>0) Paint("Skipped: "+String.Join(", ",skipped),ConsoleColor.DarkGray);
         }
     }
-    static void Hit(string s) { if (Findings.Add(s)) Log(s); }
+    static void Hit(string s) { lock(OutputLock) if (Findings.Add(s)) LogLine(s); }
     static string Sample(string hashes) {
         foreach (string item in hashes.Split(',',';')) {
             string h = item.Trim();
@@ -115,6 +117,21 @@ public class PrestigeConsoleScannerV10 {
             }
     }
     static readonly string[] Apis={"java/lang/ClassLoader","defineClass","javax/crypto/Cipher","java/net/","java/lang/reflect/","loadLibrary"};
+    static readonly byte[][] ApiBytes=Apis.Select(a=>Encoding.ASCII.GetBytes(a)).ToArray();
+    // Each Java API marker begins with j, d or l. Check candidates without decoding each class to a string.
+    static int MatchApis(byte[] bytes,int length,int found) {
+        for(int i=0;i<length && found!=63;i++) {
+            byte first=bytes[i];
+            if(first!=106 && first!=100 && first!=108)continue;
+            for(int t=0;t<ApiBytes.Length;t++) {
+                int bit=1<<t;var needle=ApiBytes[t];
+                if((found&bit)!=0 || first!=needle[0] || length-i<needle.Length)continue;
+                int j=1;while(j<needle.Length && bytes[i+j]==needle[j])j++;
+                if(j==needle.Length)found|=bit;
+            }
+        }
+        return found;
+    }
     static string JarFileIndicator(string path) {
         // Inspect bounded, decompressed class data. Treat strings as supporting evidence only.
         using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read)) {
@@ -131,8 +148,7 @@ public class PrestigeConsoleScannerV10 {
                         if(n==0)break;
                         Buffer.BlockCopy(chunk,0,block,carry,n); int length=carry+n;
                         mask=MatchBlock(block,length,mask);budget-=n;
-                        string literals=Bytes.GetString(block,0,length);
-                        for(int t=0;t<Apis.Length;t++) if((traits&(1<<t))==0 && literals.IndexOf(Apis[t],StringComparison.Ordinal)>=0)traits|=1<<t;
+                        traits=MatchApis(block,length,traits);
                         if((mask&3)!=0) return "Prestige loader endpoint in "+entry.FullName;
                         int pair=3<<Markers.Length;
                         if((mask&pair)==pair) return "Paired Prestige console strings in "+entry.FullName;
@@ -147,12 +163,15 @@ public class PrestigeConsoleScannerV10 {
     }
     // Only learn class fingerprints from an archive whose full SHA-256 matches the verified loader.
     static readonly HashSet<string> RefClasses=new HashSet<string>();
-    static HashSet<string> ClassHashes(string path) {
+    static readonly HashSet<long> ReferenceLengths=new HashSet<long>();
+    static HashSet<string> ClassHashes(string path,bool reference=false) {
         var hashes=new HashSet<string>(); long remaining=4*1024*1024;
         using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read))
         using(var sha=SHA256.Create()) foreach(var e in z.Entries) {
             if(!e.FullName.EndsWith(".class",StringComparison.OrdinalIgnoreCase)||e.Length<64 || e.Length>remaining)continue;
             remaining-=e.Length;
+            if(reference)ReferenceLengths.Add(e.Length);
+            else if(!ReferenceLengths.Contains(e.Length))continue;
             using(var st=e.Open())hashes.Add(BitConverter.ToString(sha.ComputeHash(st)));
             if(remaining<=0)break;
         }
@@ -160,7 +179,7 @@ public class PrestigeConsoleScannerV10 {
     }
     static void Disk(string[] roots) {
         int files=0, hashes=0, errors=0, links=0;
-        RefClasses.Clear(); var jarCandidates=new List<string>();
+        ReferenceLengths.Clear(); RefClasses.Clear(); var jarCandidates=new List<string>();
         var pending=new Stack<FileSystemInfo>(roots.Select(p=>(FileSystemInfo)new DirectoryInfo(p)));
         var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         while(pending.Count>0 && files<250000) {
@@ -182,7 +201,7 @@ public class PrestigeConsoleScannerV10 {
                     using(var f=File.OpenRead(path)) using(var sha=SHA256.Create()) {
                         string h=BitConverter.ToString(sha.ComputeHash(f)).Replace("-","").ToLowerInvariant();
                         string sample=Sample(h);
-                        if(sample!=null){if(h.Equals(Jar,StringComparison.OrdinalIgnoreCase))RefClasses.UnionWith(ClassHashes(path));Hit("EXACT | "+sample+" on disk | "+path+" | "+h);continue;}
+                        if(sample!=null){if(h.Equals(Jar,StringComparison.OrdinalIgnoreCase))RefClasses.UnionWith(ClassHashes(path,true));Hit("EXACT | "+sample+" on disk | "+path+" | "+h);continue;}
                     }
                 }
                 if(path.EndsWith(".jar",StringComparison.OrdinalIgnoreCase) && length<=4*1024*1024 && length>0) {
@@ -541,6 +560,16 @@ public class PrestigeConsoleScannerV10 {
             foreach(string name in key.GetValueNames()) if(name.Length==1) CheckCommand(key.GetValue(name) as string,"Current user Win+R history, entry "+name+" (undated)");
         }
     }
+    static void Amcache() {
+        using(var root=Registry.LocalMachine.OpenSubKey(@"Amcache\Root\InventoryApplicationFile")) {
+            if(root==null){Log("Coverage incomplete: mounted Amcache inventory unavailable");return;}
+            foreach(var name in root.GetSubKeyNames().Take(20000)) using(var item=root.OpenSubKey(name)) {
+                string path=item==null?null:item.GetValue("LowerCaseLongPath") as string;
+                if(path!=null && (Original(path)||path.EndsWith("taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase)))
+                    Hit("REVIEW | Mounted Amcache inventory filename | "+path);
+            }
+        }
+    }
     static void ShellLog(string channel,int eventId) {
         string query="*[System[EventID="+eventId+" and TimeCreated[timediff(@SystemTime) <= 604800000]]]";
         var q=new EventLogQuery(channel,PathType.LogName,query){ReverseDirection=true};
@@ -575,11 +604,13 @@ public class PrestigeConsoleScannerV10 {
                 string user=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
                 Paint("Checking files and history...",ConsoleColor.Cyan);
-                Run(null,delegate {Disk(roots);});
-                Run("Prefetch",Prefetch); Run("Sysmon",Events);
-                Run("PowerShell and Win+R history",History);
-                foreach(string channel in new[]{"Microsoft-Windows-PowerShell/Operational","PowerShellCore/Operational","Security"})
-                    Run(channel=="PowerShellCore/Operational"?"PowerShell 7 log":channel=="Security"?"Security log":"Windows PowerShell log",delegate {ShellLog(channel,channel=="Security"?4688:4104);});
+                var disk=System.Threading.Tasks.Task.Factory.StartNew(delegate {Run(null,delegate {Disk(roots);});}, System.Threading.CancellationToken.None,System.Threading.Tasks.TaskCreationOptions.None,System.Threading.Tasks.TaskScheduler.Default);
+                try {
+                    Run("Amcache",Amcache); Run("Prefetch",Prefetch); Run("Sysmon",Events);
+                    Run("PowerShell and Win+R history",History);
+                    foreach(string channel in new[]{"Microsoft-Windows-PowerShell/Operational","PowerShellCore/Operational","Security"})
+                        Run(channel=="PowerShellCore/Operational"?"PowerShell 7 log":channel=="Security"?"Security log":"Windows PowerShell log",delegate {ShellLog(channel,channel=="Security"?4688:4104);});
+                } finally {disk.Wait();}
             }
             Log("Distinct findings: "+Findings.Count+". Deletion alone does not establish self-destruction. A JVM may belong to another application.");
             if(args.Length==0){Console.WriteLine("Press Enter to close.");Console.ReadLine();}
@@ -589,7 +620,7 @@ public class PrestigeConsoleScannerV10 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV10' -as [type])) {
+if (!('PrestigeConsoleScannerV11' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Get-GameDiagnostics($row) {
@@ -649,15 +680,6 @@ function Get-GameDiagnostics($row) {
 }
 function Get-HistoricalIndicators {
     $names='(?i)icloudjsclownht2ogv\.exe|lesqid is gay\.jar|taskflow-2\.5\.15\.jar'
-    $key='Registry::HKEY_LOCAL_MACHINE\Amcache\Root\InventoryApplicationFile'
-    if(Test-Path -LiteralPath $key) {
-        $items=@(Get-ChildItem -LiteralPath $key -ErrorAction Stop | Select-Object -First 20000)
-        foreach($item in $items) {
-            $path=[string]$item.GetValue('LowerCaseLongPath')
-            if($path -match $names) {"REVIEW | Mounted Amcache inventory filename | $path"}
-        }
-        "Amcache inventory entries checked: $($items.Count) (limit 20000)"
-    } else { 'Coverage incomplete: mounted Amcache inventory unavailable' }
     $cache=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction SilentlyContinue
     if($cache -and $cache.AppCompatCache -is [byte[]]) {
         $text=[Text.Encoding]::Unicode.GetString($cache.AppCompatCache)
@@ -693,6 +715,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV10]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV11]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
