@@ -16,7 +16,8 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
 }
 
 Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
-Write-Host 'Discord:lesqid' -ForegroundColor Gray
+Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
+Write-Host 'Discord:LeSqid' -ForegroundColor Gray
 
 $engine = @'
 using System;
