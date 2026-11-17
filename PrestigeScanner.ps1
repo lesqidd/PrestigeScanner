@@ -15,7 +15,7 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
     throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
 }
 
-Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
+Write-Host 'PRESTIGE SCANNER' -ForegroundColor Cyan
 Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
 Write-Host 'Discord:LeSqid' -ForegroundColor Gray
 Write-Host 'Starting scan...' -ForegroundColor Cyan
@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV15 {
+public class PrestigeConsoleScannerV16 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -46,32 +46,48 @@ public class PrestigeConsoleScannerV15 {
     static HashSet<int> gamePids=new HashSet<int>();
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int handle);
     [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
-    static bool OrangeSupported() { uint mode; return GetConsoleMode(GetStdHandle(-11),out mode) && (mode&4)!=0; }
-    static void Paint(string text,ConsoleColor color,bool highlight=false,bool orange=false,ConsoleColor? background=null) {
-        if(Console.IsOutputRedirected){Console.WriteLine(text);return;}
-        var fg=Console.ForegroundColor;var bg=Console.BackgroundColor;
+    static bool SupportsAnsi() { uint mode; return GetConsoleMode(GetStdHandle(-11),out mode) && (mode&4)!=0; }
+    static void Paint(string label, ConsoleColor color, string detail="", bool bold=false, bool orange=false) {
+        if(Console.IsOutputRedirected){Console.WriteLine(label+detail);return;}
+        var original=Console.ForegroundColor;
         try {
-            if(highlight){Console.BackgroundColor=ConsoleColor.DarkRed;Console.ForegroundColor=ConsoleColor.White;}
-            else {Console.ForegroundColor=color;if(background.HasValue) Console.BackgroundColor=background.Value;}
-            if(orange && OrangeSupported()) Console.WriteLine("\u001b[1;38;2;255;165;0m"+text+"\u001b[0m");
-            else Console.WriteLine(text);
-        } finally {Console.BackgroundColor=bg;Console.ForegroundColor=fg;}
+            Console.ForegroundColor=color;
+            if(bold && SupportsAnsi()){
+                Console.Write(orange?"\u001b[1;38;2;255;165;0m":"\u001b[1m");
+                Console.Write(label);
+                Console.Write("\u001b[22m");
+            } else Console.Write(label);
+            Console.ForegroundColor=original;
+            Console.WriteLine(detail);
+        } finally {Console.ForegroundColor=original;}
     }
     static readonly object OutputLock=new object();
     static void Log(string s) { lock(OutputLock) LogLine(s); }
     static void LogLine(string s) {
         string line=s.TrimStart('\r','\n');
-        if(line.StartsWith("--- ") || line.StartsWith("MINECRAFT CLIENT |"))
-            Paint(s,ConsoleColor.White,background:ConsoleColor.DarkBlue);
-        else if(line.StartsWith("EXACT |"))
-            Paint("[DIRECT PRESTIGE MATCH] "+line,ConsoleColor.White,true);
-        else if(line.StartsWith("FILE INDICATOR |"))
-            Paint(s,ConsoleColor.DarkYellow,orange:true);
-        else if(line.StartsWith("REVIEW |") || line.StartsWith("LINKED |"))
-            Paint(s,ConsoleColor.Yellow);
-        else if(line.StartsWith("GENERIC |") || line.StartsWith("Coverage incomplete") || line.StartsWith("Unavailable:"))
-            Paint(s,ConsoleColor.Magenta);
-        else Paint(s,ConsoleColor.Gray);
+        if(line.StartsWith("--- ") && line.EndsWith(" ---")){
+            Console.WriteLine();
+            Paint(line,ConsoleColor.Cyan,bold:true);
+            return;
+        }
+        int split=line.IndexOf(" | ",StringComparison.Ordinal);
+        if(split>0){
+            string kind=line.Substring(0,split);
+            string detail=line.Substring(split);
+            switch(kind){
+                case "EXACT": Paint("[DIRECT PRESTIGE MATCH]",ConsoleColor.Red,detail,true);return;
+                case "FILE INDICATOR": Paint("[FILE INDICATOR]",ConsoleColor.Yellow,detail,true,true);return;
+                case "LINKED": Paint("[LINKED]",ConsoleColor.Magenta,detail,true);return;
+                case "REVIEW": Paint("[REVIEW]",ConsoleColor.Yellow,detail,true);return;
+                case "GENERIC": Paint("[GENERIC]",ConsoleColor.DarkCyan,detail);return;
+                case "MINECRAFT CLIENT": Paint(kind,ConsoleColor.Cyan,detail,true);return;
+            }
+        }
+        if(line.StartsWith("Coverage incomplete:") || line.StartsWith("Unavailable:"))
+            Paint("[UNAVAILABLE]",ConsoleColor.DarkYellow," "+line.Substring(line.IndexOf(':')+1).TrimStart());
+        else if(line.StartsWith("Distinct findings:"))
+            Paint("Distinct findings:",ConsoleColor.White,line.Substring("Distinct findings:".Length),true);
+        else Paint(line,ConsoleColor.Gray);
     }
     static void Hit(string s) { lock(OutputLock) if (Findings.Add(s)) LogLine(s); }
     static string Sample(string hashes) {
@@ -643,7 +659,7 @@ public class PrestigeConsoleScannerV15 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV15' -as [type])) {
+if (!('PrestigeConsoleScannerV16' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -767,6 +783,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV15]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV16]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
