@@ -15,11 +15,10 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
     throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
 }
 
-Write-Host '        Credits ' -ForegroundColor Magenta -NoNewline
+Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
+Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
 Write-Host 'Discord:LeSqid' -ForegroundColor Gray
-Write-Host "`n        Prestige Scanner`n" -ForegroundColor Cyan
-Write-Host ('[*] Windows build {0}' -f [Environment]::OSVersion.Version.Build) -ForegroundColor Cyan
-Write-Host '[*] Starting scan...' -ForegroundColor Cyan
+Write-Host 'Starting scan...' -ForegroundColor Cyan
 
 $engine = @'
 using System;
@@ -36,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV14 {
+public class PrestigeConsoleScannerV15 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -62,45 +61,17 @@ public class PrestigeConsoleScannerV14 {
     static void Log(string s) { lock(OutputLock) LogLine(s); }
     static void LogLine(string s) {
         string line=s.TrimStart('\r','\n');
-        if(line.StartsWith("--- ") && line.EndsWith(" ---")){
-            Paint("\n[*] "+line.Substring(4,line.Length-8),ConsoleColor.Cyan);
-            return;
-        }
-        if(line.StartsWith("Coverage incomplete") || line.StartsWith("Unavailable:")){
-            Paint("[!] "+line,ConsoleColor.Yellow);
-            return;
-        }
-        if(line.StartsWith("Prefetch records parsed:") || line.StartsWith("Disk coverage:") ||
-           line.StartsWith("Records examined:") || line.StartsWith("History lines examined:")){
-            Paint("[+] "+line,ConsoleColor.Green);
-            return;
-        }
-        string[] parts=line.Split(new[]{" | "},StringSplitOptions.None);
-        if(parts.Length>1){
-            string kind=parts[0];
-            if(kind=="EXACT" || kind=="FILE INDICATOR" || kind=="LINKED" || kind=="REVIEW" || kind=="GENERIC"){
-                bool file=kind=="FILE INDICATOR";
-                ConsoleColor color=kind=="EXACT"?ConsoleColor.Red:file?ConsoleColor.DarkYellow:ConsoleColor.Yellow;
-                Paint("  ["+kind+"] "+parts[1],color,orange:file);
-                for(int i=2;i<parts.Length;i++){
-                    string value=parts[i];
-                    if(i==2 && value.EndsWith(".pf",StringComparison.OrdinalIgnoreCase))
-                        value="Source: "+value;
-                    else if(kind=="EXACT" && value.Length==64 && Regex.IsMatch(value,"^[0-9a-fA-F]+$"))
-                        value="SHA-256: "+value;
-                    Paint("      "+value,ConsoleColor.Gray);
-                }
-                return;
-            }
-        }
-        Paint("[*] "+line,ConsoleColor.Cyan);
-    }
-    static void Summary(){
-        Paint("\n========================================\nSCAN COMPLETE\n========================================",ConsoleColor.Cyan);
-        foreach(string kind in new[]{"EXACT","LINKED","FILE INDICATOR","REVIEW","GENERIC"}){
-            int count=Findings.Count(f=>f.StartsWith(kind+" | "));
-            Paint(kind+": "+count,kind=="EXACT" && count>0?ConsoleColor.Red:ConsoleColor.Gray);
-        }
+        if(line.StartsWith("--- ") || line.StartsWith("MINECRAFT CLIENT |"))
+            Paint(s,ConsoleColor.White,background:ConsoleColor.DarkBlue);
+        else if(line.StartsWith("EXACT |"))
+            Paint("[DIRECT PRESTIGE MATCH] "+line,ConsoleColor.White,true);
+        else if(line.StartsWith("FILE INDICATOR |"))
+            Paint(s,ConsoleColor.DarkYellow,orange:true);
+        else if(line.StartsWith("REVIEW |") || line.StartsWith("LINKED |"))
+            Paint(s,ConsoleColor.Yellow);
+        else if(line.StartsWith("GENERIC |") || line.StartsWith("Coverage incomplete") || line.StartsWith("Unavailable:"))
+            Paint(s,ConsoleColor.Magenta);
+        else Paint(s,ConsoleColor.Gray);
     }
     static void Hit(string s) { lock(OutputLock) if (Findings.Add(s)) LogLine(s); }
     static string Sample(string hashes) {
@@ -620,8 +591,12 @@ public class PrestigeConsoleScannerV14 {
         Log("Records examined: "+count+" (7 days; limit 50000; split script blocks assessed individually)");
     }
     static void WithEventFallback(string channel,Action<string,PathType> scan) {
+        string reason;
         try {scan(channel,PathType.LogName);return;}
-        catch(EventLogException){} catch(UnauthorizedAccessException){} catch(System.Security.SecurityException){}
+        catch(EventLogNotFoundException){reason="Windows could not find the live channel";}
+        catch(EventLogException e){reason=e.Message;}
+        catch(UnauthorizedAccessException){reason="Windows denied access to the live channel";}
+        catch(System.Security.SecurityException){reason="Windows denied access to the live channel";}
         string dir=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"System32","winevt","Logs");
         string stem=channel.Replace("/","%4");
         var paths=new List<string>{Path.Combine(dir,stem+".evtx")};
@@ -632,7 +607,7 @@ public class PrestigeConsoleScannerV14 {
             try {scan(path,PathType.FilePath);readable=true;}
             catch(EventLogException){} catch(UnauthorizedAccessException){} catch(System.Security.SecurityException){}
         }
-        if(!readable)throw new IOException("No readable live or archived event log");
+        if(!readable)throw new IOException(reason+". No readable saved log was found.");
     }
     static void Run(string label, Action action) {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
@@ -651,7 +626,7 @@ public class PrestigeConsoleScannerV14 {
             if(mode!="1") {
                 string user=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
-                Paint("\n[*] Checking files and history...",ConsoleColor.Cyan);
+                Paint("Checking files and history...",ConsoleColor.Cyan);
                 var disk=System.Threading.Tasks.Task.Factory.StartNew(delegate {Run(null,delegate {Disk(roots);});}, System.Threading.CancellationToken.None,System.Threading.Tasks.TaskCreationOptions.None,System.Threading.Tasks.TaskScheduler.Default);
                 try {
                     Run("Amcache",Amcache); Run("Prefetch",Prefetch); Run("Sysmon",delegate {WithEventFallback("Microsoft-Windows-Sysmon/Operational",Events);});
@@ -660,7 +635,7 @@ public class PrestigeConsoleScannerV14 {
                         Run(channel=="PowerShellCore/Operational"?"PowerShell 7 log":channel=="Security"?"Security log":"Windows PowerShell log",delegate {WithEventFallback(channel,delegate(string src,PathType type){ShellLog(src,channel=="Security"?4688:4104,type);});});
                 } finally {disk.Wait();}
             }
-            Summary();
+            Log("Distinct findings: "+Findings.Count+". Deletion alone does not establish self-destruction. A JVM may belong to another application.");
             if(args.Length==0){Console.WriteLine("Press Enter to close.");Console.ReadLine();}
             return 0;
         } catch(Exception e){Console.Error.WriteLine(e.Message);return 1;}
@@ -668,7 +643,7 @@ public class PrestigeConsoleScannerV14 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV14' -as [type])) {
+if (!('PrestigeConsoleScannerV15' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -792,6 +767,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV14]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV15]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
