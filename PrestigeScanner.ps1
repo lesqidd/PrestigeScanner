@@ -18,6 +18,7 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
 Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
 Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
 Write-Host 'Discord:LeSqid' -ForegroundColor Gray
+Write-Host 'Starting scan...' -ForegroundColor Cyan
 
 $engine = @'
 using System;
@@ -34,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV12 {
+public class PrestigeConsoleScannerV13 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -46,22 +47,12 @@ public class PrestigeConsoleScannerV12 {
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int handle);
     [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
     static bool OrangeSupported() { uint mode; return GetConsoleMode(GetStdHandle(-11),out mode) && (mode&4)!=0; }
-    static int shown;
-    static readonly SortedSet<string> skipped=new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-    static string ShortCheck(string message) {
-        string detail=message.Substring(message.IndexOf(':')+1).Trim();
-        if(detail.Contains("jcmd")||detail.Contains("JDK")||detail.Contains("class diagnostics")||detail.Contains("Java diagnostic"))return "JVM class inspection";
-        if(detail.Contains("Amcache"))return "Amcache";
-        if(detail.Contains("ShimCache"))return "ShimCache";
-        int divider=detail.IndexOf(" - ",StringComparison.Ordinal);
-        return divider<0?detail:detail.Substring(0,divider);
-    }
-    static void Paint(string text,ConsoleColor color,bool highlight=false,bool orange=false) {
+    static void Paint(string text,ConsoleColor color,bool highlight=false,bool orange=false,ConsoleColor? background=null) {
         if(Console.IsOutputRedirected){Console.WriteLine(text);return;}
         var fg=Console.ForegroundColor;var bg=Console.BackgroundColor;
         try {
             if(highlight){Console.BackgroundColor=ConsoleColor.DarkRed;Console.ForegroundColor=ConsoleColor.White;}
-            else Console.ForegroundColor=color;
+            else {Console.ForegroundColor=color;if(background.HasValue) Console.BackgroundColor=background.Value;}
             if(orange && OrangeSupported()) Console.WriteLine("\u001b[1;38;2;255;165;0m"+text+"\u001b[0m");
             else Console.WriteLine(text);
         } finally {Console.BackgroundColor=bg;Console.ForegroundColor=fg;}
@@ -69,23 +60,18 @@ public class PrestigeConsoleScannerV12 {
     static readonly object OutputLock=new object();
     static void Log(string s) { lock(OutputLock) LogLine(s); }
     static void LogLine(string s) {
-        if(s.StartsWith("Coverage incomplete")||s.StartsWith("Unavailable:")){skipped.Add(ShortCheck(s));return;}
-        if(s.StartsWith("MINECRAFT CLIENT | scanning")){Paint(s.Replace("MINECRAFT CLIENT | scanning live PID","Scanning Minecraft PID"),ConsoleColor.Cyan);return;}
-        if(s.StartsWith("Live Java processes: 0")){Paint("No running Java process found.",ConsoleColor.Yellow);return;}
-        if(s.StartsWith("EXACT |")) {
-            string detail=Regex.Replace(s.Substring(8),@" \| [0-9a-fA-F]{64}$","");
-            Paint(" EXACT MATCH  "+detail,ConsoleColor.White,true);shown++;return;
-        }
-        if(s.StartsWith("FILE INDICATOR |")){Paint(" FILE CLUE  "+s.Substring(17),ConsoleColor.DarkYellow,false,true);shown++;return;}
-        if(s.StartsWith("LINKED |") || (s.StartsWith("REVIEW |") &&
-            (s.Contains("Minecraft PID") || s.Contains("in Minecraft memory") || s.Contains("Running Minecraft session") || s.Contains("JVM PID") || s.Contains("in Java PID")))){
-            Paint(" CHECK  "+s.Substring(s.IndexOf('|')+1).Trim(),ConsoleColor.Yellow);shown++;return;
-        }
-        if(s.StartsWith("Distinct findings:")){
-            Paint("Scan complete",ConsoleColor.Cyan);
-            if(shown==0) Paint("No priority matches surfaced.",ConsoleColor.Gray);
-            if(skipped.Count>0) Paint("Unavailable: "+String.Join(", ",skipped),ConsoleColor.DarkGray);
-        }
+        string line=s.TrimStart('\r','\n');
+        if(line.StartsWith("--- ") || line.StartsWith("MINECRAFT CLIENT |"))
+            Paint(s,ConsoleColor.White,background:ConsoleColor.DarkBlue);
+        else if(line.StartsWith("EXACT |"))
+            Paint("[DIRECT PRESTIGE MATCH] "+line,ConsoleColor.White,true);
+        else if(line.StartsWith("FILE INDICATOR |"))
+            Paint(s,ConsoleColor.DarkYellow,orange:true);
+        else if(line.StartsWith("REVIEW |") || line.StartsWith("LINKED |"))
+            Paint(s,ConsoleColor.Yellow);
+        else if(line.StartsWith("GENERIC |") || line.StartsWith("Coverage incomplete") || line.StartsWith("Unavailable:"))
+            Paint(s,ConsoleColor.Magenta);
+        else Paint(s,ConsoleColor.Gray);
     }
     static void Hit(string s) { lock(OutputLock) if (Findings.Add(s)) LogLine(s); }
     static string Sample(string hashes) {
@@ -623,7 +609,7 @@ public class PrestigeConsoleScannerV12 {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
         try {action();} catch(Exception e){Log("Coverage incomplete: "+(label??"File scan")+" - "+e.Message);}
     }
-    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { skipped.Clear(); MarkedRegions.Clear(); shown=0; Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
+    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { MarkedRegions.Clear(); Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
@@ -653,7 +639,7 @@ public class PrestigeConsoleScannerV12 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV12' -as [type])) {
+if (!('PrestigeConsoleScannerV13' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -777,6 +763,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV12]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV13]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
