@@ -16,7 +16,7 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
 }
 
 Write-Host '  PRESTIGE SCANNER  ' -ForegroundColor Black -BackgroundColor Cyan
-Write-Host 'Starting scan...' -ForegroundColor Cyan
+Write-Host 'Discord:lesqid' -ForegroundColor Gray
 
 $engine = @'
 using System;
@@ -33,7 +33,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV9 {
+public class PrestigeConsoleScannerV10 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -45,7 +45,16 @@ public class PrestigeConsoleScannerV9 {
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int handle);
     [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
     static bool OrangeSupported() { uint mode; return GetConsoleMode(GetStdHandle(-11),out mode) && (mode&4)!=0; }
-    static int gaps, shown;
+    static int shown;
+    static readonly SortedSet<string> skipped=new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+    static string ShortCheck(string message) {
+        string detail=message.Substring(message.IndexOf(':')+1).Trim();
+        if(detail.Contains("jcmd")||detail.Contains("JDK")||detail.Contains("class diagnostics")||detail.Contains("Java diagnostic"))return "JVM class inspection";
+        if(detail.Contains("Amcache"))return "Amcache";
+        if(detail.Contains("ShimCache"))return "ShimCache";
+        int divider=detail.IndexOf(" - ",StringComparison.Ordinal);
+        return divider<0?detail:detail.Substring(0,divider);
+    }
     static void Paint(string text,ConsoleColor color,bool highlight=false,bool orange=false) {
         if(Console.IsOutputRedirected){Console.WriteLine(text);return;}
         var fg=Console.ForegroundColor;var bg=Console.BackgroundColor;
@@ -57,7 +66,7 @@ public class PrestigeConsoleScannerV9 {
         } finally {Console.BackgroundColor=bg;Console.ForegroundColor=fg;}
     }
     static void Log(string s) {
-        if(s.StartsWith("Coverage incomplete")||s.StartsWith("Unavailable:")){gaps++;return;}
+        if(s.StartsWith("Coverage incomplete")||s.StartsWith("Unavailable:")){skipped.Add(ShortCheck(s));return;}
         if(s.StartsWith("MINECRAFT CLIENT | scanning")){Paint(s.Replace("MINECRAFT CLIENT | scanning live PID","Scanning Minecraft PID"),ConsoleColor.Cyan);return;}
         if(s.StartsWith("Live Java processes: 0")){Paint("No running Java process found.",ConsoleColor.Yellow);return;}
         if(s.StartsWith("EXACT |")) {
@@ -72,7 +81,7 @@ public class PrestigeConsoleScannerV9 {
         if(s.StartsWith("Distinct findings:")){
             Paint("Scan complete",ConsoleColor.Cyan);
             if(shown==0) Paint("No priority matches surfaced.",ConsoleColor.Gray);
-            if(gaps>0) Paint("Some checks were unavailable.",ConsoleColor.Yellow);
+            if(skipped.Count>0) Paint("Skipped: "+String.Join(", ",skipped),ConsoleColor.DarkGray);
         }
     }
     static void Hit(string s) { if (Findings.Add(s)) Log(s); }
@@ -250,6 +259,24 @@ public class PrestigeConsoleScannerV9 {
             if((BitConverter.ToUInt32(header,pe+24+optional+i*40+36)&0x20000000)!=0) return true;
         return false;
     }
+    sealed class MarkedRegion {
+        public long Start,End;
+        public string Name;
+    }
+    static readonly Dictionary<int,Dictionary<long,MarkedRegion>> MarkedRegions=new Dictionary<int,Dictionary<long,MarkedRegion>>();
+    static void RecordNativeRegion(int pid,IntPtr allocation,long end,string name) {
+        Dictionary<long,MarkedRegion> regions;
+        if(!MarkedRegions.TryGetValue(pid,out regions)) MarkedRegions[pid]=regions=new Dictionary<long,MarkedRegion>();
+        long start=allocation.ToInt64();
+        regions[start]=new MarkedRegion{Start=start,End=end,Name=name};
+    }
+    static string RegionAt(int pid,string address) {
+        Dictionary<long,MarkedRegion> regions;long start;
+        if(!address.StartsWith("0x",StringComparison.OrdinalIgnoreCase) || !MarkedRegions.TryGetValue(pid,out regions) ||
+            !long.TryParse(address.Substring(2),System.Globalization.NumberStyles.HexNumber,System.Globalization.CultureInfo.InvariantCulture,out start))return null;
+        foreach(var r in regions.Values) if(start>=r.Start && start<r.End)return r.Name;
+        return null;
+    }
     static void Memory() {
         var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
@@ -319,8 +346,23 @@ public class PrestigeConsoleScannerV9 {
                             pos+=size;
                         }
                     } else tail=0;
+                    string backing;
+                    if(gamePids.Contains(pid) && (localMask&(HostBit|3))!=0 &&
+                        (moduleNames.TryGetValue(allocation,out backing)||privateImages.Contains(allocation)))
+                        RecordNativeRegion(pid,allocation,end,backing??"private DLL-like memory");
                     address=end;
                 }
+                if(MarkedRegions.ContainsKey(pid)) try {
+                    var seenStarts=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach(ProcessThread thread in p.Threads) using(thread) {
+                        try {
+                            string owner=RegionAt(pid,"0x"+thread.StartAddress.ToInt64().ToString("X"));
+                            if(owner!=null && seenStarts.Add(owner))
+                                Hit("LINKED | Minecraft PID "+pid+" | live thread start in "+owner+" with a Prestige marker");
+                        } catch(System.ComponentModel.Win32Exception){} catch(InvalidOperationException){}
+                    }
+                } catch(System.ComponentModel.Win32Exception){Log("Coverage incomplete: Minecraft thread check");}
+                  catch(InvalidOperationException){Log("Coverage incomplete: Minecraft thread check");}
                 int markerCount=Markers.Where((m,i)=>(mask&(1<<i))!=0).Count();
                 bool consolePair=(mask&(3<<Markers.Length))==(3<<Markers.Length);
                 Log(target+" | PID "+pid+" | loader markers: "+markerCount+" | API hostname in memory: "+((mask&HostBit)!=0)+" | Prestige console pair: "+consolePair+" | "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
@@ -431,6 +473,12 @@ public class PrestigeConsoleScannerV9 {
                         }
                     }
                     if(e.Id==8 && Java(v("TargetImage"))) {
+                        int targetPid;DateTime targetStart;
+                        if(int.TryParse(v("TargetProcessId"),out targetPid) && GameStarts.TryGetValue(targetPid,out targetStart) &&
+                            e.TimeCreated.HasValue && e.TimeCreated.Value.ToUniversalTime()>=targetStart && SameLiveProcess(targetPid,targetStart)) {
+                            string backing=RegionAt(targetPid,v("StartAddress"));
+                            if(backing!=null)Hit("LINKED | Minecraft PID "+targetPid+" | remote thread from "+Path.GetFileName(v("SourceImage"))+" started at an address now in "+backing+" with a Prestige marker"+where);
+                        }
                         bool linked=known.Contains(v("SourceProcessGuid"));
                         Hit((linked?"LINKED":"GENERIC")+" | remote thread into Java | "+v("SourceImage")+" -> "+v("TargetImage")+" PID "+v("TargetProcessId")+where);
                     }
@@ -510,9 +558,9 @@ public class PrestigeConsoleScannerV9 {
     }
     static void Run(string label, Action action) {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
-        try {action();} catch(Exception e){Log("Coverage incomplete: "+e.Message);}
+        try {action();} catch(Exception e){Log("Coverage incomplete: "+(label??"File scan")+" - "+e.Message);}
     }
-    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { gaps=0; shown=0; Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
+    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { skipped.Clear(); MarkedRegions.Clear(); shown=0; Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
@@ -527,10 +575,10 @@ public class PrestigeConsoleScannerV9 {
                 string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
                 Paint("Checking files and history...",ConsoleColor.Cyan);
                 Run(null,delegate {Disk(roots);});
-                Run("Prefetch",Prefetch); Run("Event history",Events);
+                Run("Prefetch",Prefetch); Run("Sysmon",Events);
                 Run("PowerShell and Win+R history",History);
                 foreach(string channel in new[]{"Microsoft-Windows-PowerShell/Operational","PowerShellCore/Operational","Security"})
-                    Run(channel,delegate {ShellLog(channel,channel=="Security"?4688:4104);});
+                    Run(channel=="PowerShellCore/Operational"?"PowerShell 7 log":channel=="Security"?"Security log":"Windows PowerShell log",delegate {ShellLog(channel,channel=="Security"?4688:4104);});
             }
             Log("Distinct findings: "+Findings.Count+". Deletion alone does not establish self-destruction. A JVM may belong to another application.");
             if(args.Length==0){Console.WriteLine("Press Enter to close.");Console.ReadLine();}
@@ -540,7 +588,7 @@ public class PrestigeConsoleScannerV9 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV9' -as [type])) {
+if (!('PrestigeConsoleScannerV10' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Get-GameDiagnostics($row) {
@@ -644,6 +692,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV9]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV10]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
