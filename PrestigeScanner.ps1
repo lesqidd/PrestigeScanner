@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV16 {
+public class PrestigeConsoleScannerV17 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -299,6 +299,7 @@ public class PrestigeConsoleScannerV16 {
         foreach(var r in regions.Values) if(start>=r.Start && start<r.End)return r.Name;
         return null;
     }
+    static readonly Dictionary<int,long> LoadedSchedulerPids=new Dictionary<int,long>();
     static void Memory() {
         var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
@@ -338,6 +339,12 @@ public class PrestigeConsoleScannerV16 {
                             UIntPtr count;
                             ReadProcessMemory(h,new IntPtr(pos),buf,(UIntPtr)size,out count);
                             int n=(int)count.ToUInt64();
+                            if(n==0 && size>Environment.SystemPageSize){
+                                // Retry just the current page before moving past an unreadable area.
+                                size=Math.Min(size,Environment.SystemPageSize-(int)(pos%Environment.SystemPageSize));
+                                ReadProcessMemory(h,new IntPtr(pos),buf,(UIntPtr)size,out count);
+                                n=(int)count.ToUInt64();
+                            }
                             if(n>0) {
                                 Buffer.BlockCopy(buf,0,block,tail,n);
                                 int length=tail+n;
@@ -364,8 +371,9 @@ public class PrestigeConsoleScannerV16 {
                                 tail=Math.Min(length,Overlap);
                                 Buffer.BlockCopy(block,length-tail,block,0,tail);
                             }
-                            if(n<size){failures++;tail=0;}
-                            pos+=size;
+                            if(n<size)failures++;
+                            if(n==0)tail=0;
+                            pos+=n>0?n:size;
                         }
                     } else tail=0;
                     string backing;
@@ -385,6 +393,9 @@ public class PrestigeConsoleScannerV16 {
                     }
                 } catch(System.ComponentModel.Win32Exception){Log("Coverage incomplete: Minecraft thread check");}
                   catch(InvalidOperationException){Log("Coverage incomplete: Minecraft thread check");}
+                long classStart; DateTime memoryStart;
+                if(LoadedSchedulerPids.TryGetValue(pid,out classStart) && GameStarts.TryGetValue(pid,out memoryStart) && memoryStart.Ticks==classStart && (mask&HostBit)!=0)
+                    Hit("LINKED | Minecraft PID "+pid+" | JVM reports TaskScheduler loaded and the Prestige API hostname was found in this process | injection unconfirmed");
                 int markerCount=Markers.Where((m,i)=>(mask&(1<<i))!=0).Count();
                 bool consolePair=(mask&(3<<Markers.Length))==(3<<Markers.Length);
                 Log(target+" | PID "+pid+" | loader markers: "+markerCount+" | API hostname in memory: "+((mask&HostBit)!=0)+" | Prestige console pair: "+consolePair+" | "+(total/1048576)+" MiB read; partial/unreadable chunks "+failures+"; time limit reached: "+(clock.Elapsed.TotalSeconds>=60));
@@ -629,13 +640,23 @@ public class PrestigeConsoleScannerV16 {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
         try {action();} catch(Exception e){Log("Coverage incomplete: "+(label??"File scan")+" - "+e.Message);}
     }
-    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { MarkedRegions.Clear(); Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
+    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { LoadedSchedulerPids.Clear(); MarkedRegions.Clear(); Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
             Log("Prestige Scanner | UTC "+DateTime.UtcNow.ToString("u")+" | mode "+mode);
             Log("EXACT = known loader bytes/hash; LINKED = attributed event; REVIEW/GENERIC = lead. No match cannot clear a player.");
             foreach(string line in extra) {
+                const string loaded="REVIEW | JVM reports the reference TaskScheduler class loaded | PID ";
+                if(line.StartsWith(loaded,StringComparison.Ordinal)){
+                    string[] identity=line.Substring(loaded.Length).Split('@');
+                    int classPid; long startTicks;
+                    if(identity.Length==2 && int.TryParse(identity[0],out classPid) && long.TryParse(identity[1],out startTicks) && gamePids.Contains(classPid)){
+                        LoadedSchedulerPids[classPid]=startTicks;
+                        Hit(loaded+classPid);
+                        continue;
+                    }
+                }
                 if(line.StartsWith("EXACT |")||line.StartsWith("GENERIC |")||line.StartsWith("REVIEW |"))Hit(line);else Log(line);
             }
             if(mode!="2") Run("Live Java memory",Memory);
@@ -659,7 +680,7 @@ public class PrestigeConsoleScannerV16 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV16' -as [type])) {
+if (!('PrestigeConsoleScannerV17' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -719,6 +740,8 @@ function Get-GameDiagnostics($row) {
         "Coverage incomplete: JVM class inspection (no matching local JDK)"
         return
     }
+    $identityProcess=Get-Process -Id $gameId -ErrorAction Stop
+    try { $startTicks=$identityProcess.StartTime.ToUniversalTime().Ticks } finally { $identityProcess.Dispose() }
     foreach ($query in 'VM.classloaders','VM.class_hierarchy net.taskflow.sched.TaskScheduler') {
         $info = New-Object Diagnostics.ProcessStartInfo
         $info.FileName=$tool
@@ -740,8 +763,8 @@ function Get-GameDiagnostics($row) {
             }
             $data=$stdout.GetAwaiter().GetResult()
             if($proc.ExitCode -ne 0 -or $data -match '(?i)unknown diagnostic command|diagnosticcommandexception') { "Coverage incomplete: $query unavailable in PID $gameId"; continue }
-            if($data -match '(?im)^\s*(?:[|+\- ]*)net[./]taskflow[./]sched[./]TaskScheduler(?:[/@$\s]|$)') {
-                "REVIEW | Live JVM class or class loader matching the reference TaskScheduler name | PID $gameId | $query"
+            if($query -like 'VM.class_hierarchy *' -and $data -match '(?im)^[ \t|+\-]*net[./]taskflow[./]sched[./]TaskScheduler(?:[/@ \t].*)?\r?$') {
+                "REVIEW | JVM reports the reference TaskScheduler class loaded | PID ${gameId}@$startTicks"
             } else { "Java diagnostics | PID $gameId | checked $query" }
         } finally {$proc.Dispose()}
     }
@@ -774,7 +797,9 @@ if ($Mode -ne '2') {
         $clientEntry = '(?i)(?:^|\s|")(?:net\.minecraft\.client\.main\.Main|(?:net\.fabricmc\.loader(?:\.impl)?|org\.quiltmc\.loader\.impl)\.launch\.knot\.KnotClient)(?=\s|"|$)'
         $minecraftIds = @($java | Where-Object {
             $_.CommandLine -match $clientEntry -or
-            $_.CommandLine -match '(?i)--launchTarget(?:\s+|=)"?(?:forgeclient|neoforgeclient|fmlclient)(?:\s|"|$)' -or
+            $_.CommandLine -match '(?i)--launchTarget"?(?:\s+|=)"?(?:forgeclient|neoforgeclient|fmlclient)(?:\s|"|$)' -or
+            ($_.CommandLine -match '(?i)(?:^|\s)"?net\.minecraft\.launchwrapper\.Launch"?(?=\s|$)' -and
+             $_.CommandLine -match '(?i)(?:^|\s)"?--tweakClass"?(?:\s+|=)"?(?:net\.minecraftforge\.fml\.common\.launcher\.FMLTweaker|cpw\.mods\.fml\.common\.launcher\.FMLTweaker|optifine\.OptiFineTweaker)"?(?=\s|$)') -or
             ($_.CommandLine -match '(?i)--gameDir\b' -and $_.CommandLine -match '(?i)--assetsDir\b' -and $_.CommandLine -match '(?i)--assetIndex\b')
         } | ForEach-Object { $row=$_; try { foreach ($line in @(Get-GameDiagnostics $row)) {$extra.Add([string]$line)} } catch {$extra.Add("Coverage incomplete: Java diagnostic unavailable for PID $($row.ProcessId)")} ; [int]$row.ProcessId })
     } catch { Write-Host 'Minecraft identification unavailable. Checking all Java processes.' -ForegroundColor Yellow }
@@ -783,6 +808,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV16]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV17]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
