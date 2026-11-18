@@ -123,7 +123,7 @@ public class PrestigeConsoleScannerV18 {
     }
     static readonly string[] Apis={"java/lang/ClassLoader","defineClass","javax/crypto/Cipher","java/net/","java/lang/reflect/","loadLibrary"};
     static readonly byte[][] ApiBytes=Apis.Select(a=>Encoding.ASCII.GetBytes(a)).ToArray();
-    // Each Java API marker begins with j, d or l. Check candidates without decoding each class to a string.
+    // Match API names directly against class bytes.
     static int MatchApis(byte[] bytes,int length,int found) {
         for(int i=0;i<length && found!=63;i++) {
             byte first=bytes[i];
@@ -138,7 +138,7 @@ public class PrestigeConsoleScannerV18 {
         return found;
     }
     static string JarFileIndicator(string path) {
-        // Inspect bounded, decompressed class data. Treat strings as supporting evidence only.
+        // Limit decompressed class data to bound memory use.
         using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read)) {
             if(LoaderStructure(z)) return "Known loader manifest and class structure";
             int budget=4*1024*1024; int traits=0;
@@ -166,7 +166,7 @@ public class PrestigeConsoleScannerV18 {
         }
         return null;
     }
-    // Only learn class fingerprints from an archive whose full SHA-256 matches the verified loader.
+    // Seed class hashes only from a JAR matching the reference SHA-256.
     static readonly HashSet<string> RefClasses=new HashSet<string>();
     static readonly HashSet<long> ReferenceLengths=new HashSet<long>();
     static HashSet<string> ClassHashes(string path,bool reference=false) {
@@ -233,7 +233,7 @@ public class PrestigeConsoleScannerV18 {
     [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h,IntPtr p,byte[] data,UIntPtr size,out UIntPtr count);
     static readonly string[] Markers = {Host+"/stage2Download", Host+"/launcherDownload","net/taskflow/sched/TaskScheduler","net.taskflow.sched.TaskScheduler"};
     static readonly string[] ConsoleLines = {"Initializing Prestige","Hook mode: Legacy (JVMTI retransform)"};
-    // Skip positions whose trailing byte pair cannot end any marker prefix.
+    // Use byte-pair shifts to skip impossible matches.
     static readonly string[] Labels = Markers.Concat(ConsoleLines).Concat(new[]{Host}).ToArray();
     static readonly int HostBit=1<<(Labels.Length-1);
     static readonly Dictionary<int,DateTime> GameStarts=new Dictionary<int,DateTime>();
@@ -349,7 +349,7 @@ public class PrestigeConsoleScannerV18 {
                             ReadProcessMemory(h,new IntPtr(pos),buf,(UIntPtr)size,out count);
                             int n=(int)count.ToUInt64();
                             if(n==0 && size>Environment.SystemPageSize){
-                                // Retry just the current page before moving past an unreadable area.
+                                // Retry one page when a larger read fails.
                                 size=Math.Min(size,Environment.SystemPageSize-(int)(pos%Environment.SystemPageSize));
                                 ReadProcessMemory(h,new IntPtr(pos),buf,(UIntPtr)size,out count);
                                 n=(int)count.ToUInt64();
@@ -445,7 +445,7 @@ public class PrestigeConsoleScannerV18 {
                     if(Original(s) || String.Equals(Path.GetFileName(s),"taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase)) Hit("REVIEW | Prefetch filename lead | "+name+" | "+s+" | filename evidence only");
                     if(!s.EndsWith(".jar",StringComparison.OrdinalIgnoreCase)) continue;
                     references++;
-                    // Prefetch commonly uses volume-relative names. Verify the volume before opening a referenced file.
+                    // Resolve the Prefetch volume before opening the file.
                     foreach(var map in volumes) {
                         string letter=map.Key, prefix=map.Value;
                         string path=s.StartsWith(prefix,StringComparison.OrdinalIgnoreCase)?letter+"\\"+s.Substring(prefix.Length):null;
@@ -470,7 +470,7 @@ public class PrestigeConsoleScannerV18 {
         var known=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var apiQueries=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
         var remoteThreads=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
-        // First pass establishes identity, irrespective of how recently a later event was written.
+        // Collect process identities before correlating events.
         foreach(var ids in new[]{new[]{1},new[]{8,22,23,26}}) {
             string query="*[System[("+String.Join(" or ",ids.Select(i=>"EventID="+i))+") and TimeCreated[timediff(@SystemTime) <= 604800000]]]";
             var q=new EventLogQuery(channel,kindOfPath,query){ReverseDirection=true};
