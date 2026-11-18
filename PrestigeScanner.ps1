@@ -35,12 +35,10 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV19 {
+public class PrestigeConsoleScannerV20 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
-    const string OriginalExe = "icloudjsclownht2ogv.exe";
-    const string OriginalJar = "lesqid is gay.jar";
     static readonly Encoding Bytes = Encoding.GetEncoding(28591);
     static readonly HashSet<string> Findings = new HashSet<string>();
     static HashSet<int> gamePids=new HashSet<int>();
@@ -103,7 +101,6 @@ public class PrestigeConsoleScannerV19 {
         return null;
     }
     static bool Java(string path) { string n=Path.GetFileName(path).ToLowerInvariant(); return n=="java.exe" || n=="javaw.exe"; }
-    static bool Original(string path) { string n=Path.GetFileName(path); return String.Equals(n,OriginalExe,StringComparison.OrdinalIgnoreCase)||String.Equals(n,OriginalJar,StringComparison.OrdinalIgnoreCase); }
     static bool LoaderStructure(string path) {
         using(var f=File.OpenRead(path)) using(var z=new ZipArchive(f,ZipArchiveMode.Read)) return LoaderStructure(z);
     }
@@ -447,7 +444,6 @@ public class PrestigeConsoleScannerV19 {
         var checkedPaths=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach(var f in Directory.EnumerateFiles(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"Prefetch"),"*.pf")) {
             string name=Path.GetFileName(f);
-            if(name.StartsWith(OriginalExe+"-",StringComparison.OrdinalIgnoreCase)) Hit("REVIEW | Original EXE name in Prefetch | "+name+" | name only");
             try {
                 if(new FileInfo(f).Length>32*1024*1024){skipped++;continue;}
                 byte[] b=Unpack(File.ReadAllBytes(f));
@@ -456,7 +452,7 @@ public class PrestigeConsoleScannerV19 {
                 if(offset<0 || length<0 || (length%2)!=0 || (long)offset+length>b.Length){skipped++;continue;}
                 read++;
                 foreach(string s in Encoding.Unicode.GetString(b,offset,length).Split('\0')) {
-                    if(Original(s) || String.Equals(Path.GetFileName(s),"taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase)) Hit("REVIEW | Prefetch filename lead | "+name+" | "+s+" | filename evidence only");
+                    if(String.Equals(Path.GetFileName(s),"taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase)) Hit("REVIEW | Prefetch filename lead | "+name+" | "+s+" | filename evidence only");
                     if(!s.EndsWith(".jar",StringComparison.OrdinalIgnoreCase)) continue;
                     references++;
                     // Resolve the Prefetch volume before opening the file.
@@ -549,9 +545,9 @@ public class PrestigeConsoleScannerV19 {
                         bool linked=known.Contains(v("SourceProcessGuid"));
                         Hit((linked?"LINKED":"GENERIC")+" | remote thread into Java | "+v("SourceImage")+" -> "+v("TargetImage")+" PID "+v("TargetProcessId")+where);
                     }
-                    if((e.Id==23||e.Id==26) && (kind!=null||Original(target)||known.Contains(id))) {
-                        string what=kind!=null?"Exact loader file deleted":known.Contains(id)?"Known loader deleted a file":"Original filename deleted";
-                        Hit((kind!=null||known.Contains(id)?"LINKED":"REVIEW")+" | "+what+" | "+target+" | deleting process "+v("Image")+where);
+                    if((e.Id==23||e.Id==26) && (kind!=null||known.Contains(id))) {
+                        string what=kind!=null?"Exact loader file deleted":"Known loader deleted a file";
+                        Hit("LINKED | "+what+" | "+target+" | deleting process "+v("Image")+where);
                     }
                 }
             }
@@ -570,6 +566,8 @@ public class PrestigeConsoleScannerV19 {
         var endpoint=Endpoint.Match(command);
         if(endpoint.Success) {
             string route=endpoint.Groups[1].Value.ToLowerInvariant()+".php";
+            if(route=="r.php" && Regex.IsMatch(command,@"(?i)\[(?:System\.)?Reflection\.Assembly\]\s*::\s*Load\s*\(\s*\(\s*Invoke-WebRequest\s+['""]https://prestigeclient\.vip/downloads/r\.php['""][^()\r\n]{0,128}\)\s*\.Content\s*\)\s*\.EntryPoint\s*\.\s*Invoke\s*\("))
+                return "REVIEW | Prestige r.php assembly loader command in recorded text";
             return "REVIEW | Reported Prestige "+route+" endpoint in recorded text";
         }
         string normalized=command.Replace("\u0060","").ToLowerInvariant();
@@ -610,13 +608,13 @@ public class PrestigeConsoleScannerV19 {
     static void ReadAmcacheHive(string path) {
         using(var f=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)) {
             if(f.ReadByte()!=114 || f.ReadByte()!=101 || f.ReadByte()!=103 || f.ReadByte()!=102)throw new InvalidDataException("Invalid hive header");
-            string[] names={OriginalExe,OriginalJar,"taskflow-2.5.15.jar"};
+            const string name="taskflow-2.5.15.jar";
             byte[] data=new byte[65536+256];int carry=0,n;
             while((n=f.Read(data,carry,65536))>0){
                 int length=carry+n;
                 for(int offset=0;offset<=1;offset++){
                     string view=Encoding.Unicode.GetString(data,offset,(length-offset)&~1);
-                    foreach(string name in names)if(view.IndexOf(name,StringComparison.OrdinalIgnoreCase)>=0)
+                    if(view.IndexOf(name,StringComparison.OrdinalIgnoreCase)>=0)
                         Hit("REVIEW | Amcache hive filename string | "+name+" | inventory lead only");
                 }
                 carry=Math.Min(256,length);Buffer.BlockCopy(data,length-carry,data,0,carry);
@@ -631,7 +629,7 @@ public class PrestigeConsoleScannerV19 {
             if(root==null){ReadAmcacheHive(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"appcompat","Programs","Amcache.hve"));return;}
             foreach(var name in root.GetSubKeyNames().Take(20000)) using(var item=root.OpenSubKey(name)) {
                 string path=item==null?null:item.GetValue("LowerCaseLongPath") as string;
-                if(path!=null && (Original(path)||path.EndsWith("taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase)))
+                if(path!=null && String.Equals(Path.GetFileName(path),"taskflow-2.5.15.jar",StringComparison.OrdinalIgnoreCase))
                     Hit("REVIEW | Mounted Amcache inventory filename | "+path);
             }
         }
@@ -715,7 +713,7 @@ public class PrestigeConsoleScannerV19 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV19' -as [type])) {
+if (!('PrestigeConsoleScannerV20' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -820,7 +818,7 @@ function Get-HistoricalIndicators {
             }
         }
     }
-    $names='(?i)icloudjsclownht2ogv\.exe|lesqid is gay\.jar|taskflow-2\.5\.15\.jar'
+    $names='(?i)taskflow-2\.5\.15\.jar'
     $cache=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction SilentlyContinue
     if($cache -and $cache.AppCompatCache -is [byte[]]) {
         $text=[Text.Encoding]::Unicode.GetString($cache.AppCompatCache)
@@ -858,6 +856,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV19]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV20]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
