@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV20 {
+public class PrestigeConsoleScannerV21 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -319,6 +319,49 @@ public class PrestigeConsoleScannerV20 {
            ((mask&HostBit)!=0 && (mask&12)!=0)) return 2;
         return (mask&HostBit)!=0?1:0;
     }
+    static string JavaAgentExport(byte[] directory, uint directoryRva, uint imageSize) {
+        if(directory.Length<40) return null;
+        uint names=BitConverter.ToUInt32(directory,24);
+        uint functions=BitConverter.ToUInt32(directory,20);
+        long nameTable=(long)BitConverter.ToUInt32(directory,32)-directoryRva;
+        long ordinals=(long)BitConverter.ToUInt32(directory,36)-directoryRva;
+        long addresses=(long)BitConverter.ToUInt32(directory,28)-directoryRva;
+        if(names>65536 || functions>65536 || nameTable<0 || ordinals<0 || addresses<0 ||
+           nameTable+4L*names>directory.Length || ordinals+2L*names>directory.Length ||
+           addresses+4L*functions>directory.Length) return null;
+        for(int i=0;i<names;i++){
+            long name=(long)BitConverter.ToUInt32(directory,(int)nameTable+4*i)-directoryRva;
+            if(name<0 || name+13>directory.Length || directory[(int)name]!='A') continue;
+            int ordinal=BitConverter.ToUInt16(directory,(int)ordinals+2*i);
+            if(ordinal>=functions) continue;
+            uint function=BitConverter.ToUInt32(directory,(int)addresses+4*ordinal);
+            if(function==0 || function>=imageSize || (function>=directoryRva && function-directoryRva<directory.Length)) continue;
+            int end=(int)name;
+            while(end<directory.Length && end-name<=14 && directory[end]!=0)end++;
+            if(end==directory.Length || directory[end]!=0)continue;
+            string entry=Encoding.ASCII.GetString(directory,(int)name,end-(int)name);
+            if(entry=="Agent_OnAttach" || entry=="Agent_OnLoad")return entry;
+        }
+        return null;
+    }
+    static string InspectAgentModule(IntPtr process,IntPtr allocation,int moduleSize) {
+        byte[] header=new byte[4096]; UIntPtr count;
+        if(moduleSize<header.Length || !ReadProcessMemory(process,allocation,header,(UIntPtr)header.Length,out count) ||
+           count.ToUInt64()!=(ulong)header.Length || header[0]!='M' || header[1]!='Z')return null;
+        int pe=BitConverter.ToInt32(header,60);
+        if(pe<64 || pe>header.Length-144 || BitConverter.ToUInt32(header,pe)!=0x4550)return null;
+        int optional=pe+24, magic=BitConverter.ToUInt16(header,optional);
+        int dataDirectory=magic==523?112:magic==267?96:0;
+        if(dataDirectory==0 || BitConverter.ToUInt16(header,pe+20)<dataDirectory+8 ||
+           BitConverter.ToUInt32(header,optional+dataDirectory-4)==0)return null;
+        uint rva=BitConverter.ToUInt32(header,optional+dataDirectory);
+        uint size=BitConverter.ToUInt32(header,optional+dataDirectory+4);
+        if(rva==0 || size<40 || size>1024*1024 || (ulong)rva+size>(ulong)moduleSize)return null;
+        byte[] directory=new byte[size];
+        if(!ReadProcessMemory(process,IntPtr.Add(allocation,(int)rva),directory,(UIntPtr)size,out count) ||
+           count.ToUInt64()!=size)return null;
+        return JavaAgentExport(directory,rva,(uint)moduleSize);
+    }
     static void Memory() {
         var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
@@ -331,8 +374,10 @@ public class PrestigeConsoleScannerV20 {
             catch(InvalidOperationException){Log("PID "+pid+" exited.");continue;}
             IntPtr h=OpenProcess(0x410,false,pid);
             if(h==IntPtr.Zero){Log("Unavailable: JVM PID "+pid+" could not be opened.");continue;}
+            var moduleSizes=new Dictionary<IntPtr,int>();
+            var agentChecks=new HashSet<IntPtr>();
             var moduleNames=new Dictionary<IntPtr,string>();var privateImages=new HashSet<IntPtr>();
-            if(gamePids.Contains(pid)) try { foreach(ProcessModule module in p.Modules) using(module) moduleNames[module.BaseAddress]=module.ModuleName; }
+            if(gamePids.Contains(pid)) try { foreach(ProcessModule module in p.Modules) using(module) {moduleNames[module.BaseAddress]=module.ModuleName;moduleSizes[module.BaseAddress]=module.ModuleMemorySize;} }
             catch(System.ComponentModel.Win32Exception){Log("Coverage incomplete: native module enumeration PID "+pid);}
             catch(InvalidOperationException){Log("Coverage incomplete: process exited during module enumeration");}
             long address=0,total=0; IntPtr allocation=IntPtr.Zero;int localMask=0; int failures=0;
@@ -391,6 +436,11 @@ public class PrestigeConsoleScannerV20 {
                     string backing;
                     if(gamePids.Contains(pid) && localMask!=0 &&
                         (moduleNames.TryGetValue(allocation,out backing)||privateImages.Contains(allocation))){
+                        int moduleSize;
+                        if((localMask&HostBit)!=0 && moduleSizes.TryGetValue(allocation,out moduleSize) && agentChecks.Add(allocation)){
+                            string entry=InspectAgentModule(h,allocation,moduleSize);
+                            if(entry!=null) Hit("LINKED | Minecraft PID "+pid+" | "+backing+" contains the Prestige hostname and exports "+entry+" | Java agent entry point present; invocation unverified");
+                        }
                         int level=NativeTraceLevel(localMask);
                         if(level>reportedNativeLevel){
                             reportedNativeLevel=level;
@@ -713,7 +763,7 @@ public class PrestigeConsoleScannerV20 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV20' -as [type])) {
+if (!('PrestigeConsoleScannerV21' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -856,6 +906,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV20]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV21]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
