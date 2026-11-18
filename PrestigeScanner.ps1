@@ -15,7 +15,7 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
     throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
 }
 
-Write-Host 'PRESTIGE SCANNER v23' -ForegroundColor Cyan
+Write-Host 'PRESTIGE SCANNER v24' -ForegroundColor Cyan
 Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
 Write-Host 'Discord:LeSqid' -ForegroundColor Gray
 Write-Host 'Starting scan...' -ForegroundColor Cyan
@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV23 {
+public class PrestigeConsoleScannerV24 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -192,12 +192,18 @@ public class PrestigeConsoleScannerV23 {
     static void Disk(string[] roots) {
         int files=0, hashes=0, errors=0, links=0;
         ReferenceLengths.Clear(); RefClasses.Clear(); var jarCandidates=new List<string>();
-        var pending=new Stack<FileSystemInfo>(roots.Where(p=>!String.IsNullOrWhiteSpace(p)).Select(p=>(FileSystemInfo)new DirectoryInfo(p)));
+        var pending=new Stack<FileSystemInfo>();
+        foreach(string root in roots.Where(p=>!String.IsNullOrWhiteSpace(p))){
+            try {pending.Push(new DirectoryInfo(root));}
+            catch(ArgumentException){errors++;}
+            catch(IOException){errors++;}
+        }
         var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         while(pending.Count>0 && files<250000) {
-            var item=pending.Pop(); string path=item.FullName;
-            if(!seen.Add(path)) continue;
+            var item=pending.Pop();
             try {
+                string path=item.FullName;
+                if(!seen.Add(path))continue;
                 var attr=item.Attributes;
                 if((int)attr==-1){errors++;continue;}
                 if((attr & FileAttributes.ReparsePoint)!=0) {links++; continue;}
@@ -225,12 +231,12 @@ public class PrestigeConsoleScannerV23 {
                     try { string reason=JarFileIndicator(path); if(reason!=null)Hit((reason.StartsWith("GENERIC:")?"GENERIC | ":"FILE INDICATOR | ")+reason+" | "+path); }
                     catch(InvalidDataException){errors++;}
                 }
-            } catch(UnauthorizedAccessException){errors++;} catch(IOException){errors++;}
+            } catch(UnauthorizedAccessException){errors++;} catch(IOException){errors++;} catch(ArgumentException){errors++;}
         }
         if(RefClasses.Count>=2) foreach(var path in jarCandidates) {
             try {int shared=ClassHashes(path).Count(RefClasses.Contains);
                 if(shared>=2)Hit("FILE INDICATOR | "+shared+" identical class files shared with verified JAR loader | "+path);
-            }catch(InvalidDataException){errors++;}catch(IOException){errors++;}catch(UnauthorizedAccessException){errors++;}
+            }catch(InvalidDataException){errors++;}catch(IOException){errors++;}catch(UnauthorizedAccessException){errors++;}catch(ArgumentException){errors++;}
         }
         Log("Reference class fingerprints available: "+RefClasses.Count+"; small repack candidates retained: "+jarCandidates.Count+" (limit 2048)");
         Log("Disk coverage: "+files+" files inspected; "+hashes+" size candidates hashed; "+errors+" unavailable; "+links+" links skipped; scan limit reached: "+(pending.Count>0));
@@ -453,7 +459,7 @@ public class PrestigeConsoleScannerV23 {
                     if(gamePids.Contains(pid) && (localMask&HostBit)!=0 && !hostnameImageChecked &&
                        (moduleCandidate || r.Type==0x1000000)){
                         hostnameImageChecked=true;
-                        if(privateImages.Contains(allocation) || PrivateDll(h,allocation)){
+                        if(moduleCandidate || PrivateDll(h,allocation)){
                             if(!NativeHostModules.ContainsKey(pid))
                                 NativeHostModules[pid]=backing??"DLL image at 0x"+allocation.ToInt64().ToString("X");
                         }
@@ -489,7 +495,7 @@ public class PrestigeConsoleScannerV23 {
                 ReportSessionMarkers(pid,mask);
                 if(gamePids.Contains(pid)){
                     string nativeHost;
-                    Log("Session evidence | PID "+pid+" | hostname in DLL: "+
+                    Log("Session evidence | PID "+pid+" | hostname in native module: "+
                         (NativeHostModules.TryGetValue(pid,out nativeHost)?nativeHost:"not observed")+
                         " | TaskScheduler text: "+((mask&12)!=0?"found":"not observed"));
                 }
@@ -796,7 +802,7 @@ public class PrestigeConsoleScannerV23 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV23' -as [type])) {
+if (!('PrestigeConsoleScannerV24' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -939,6 +945,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV23]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV24]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
