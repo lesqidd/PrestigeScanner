@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV17 {
+public class PrestigeConsoleScannerV18 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -77,7 +77,10 @@ public class PrestigeConsoleScannerV17 {
             switch(kind){
                 case "EXACT": Paint("[DIRECT PRESTIGE MATCH]",ConsoleColor.Red,detail,true);return;
                 case "FILE INDICATOR": Paint("[FILE INDICATOR]",ConsoleColor.Yellow,detail,true,true);return;
-                case "LINKED": Paint("[LINKED]",ConsoleColor.Magenta,detail,true);return;
+                case "LINKED":
+                    if(detail.StartsWith(" | Minecraft PID ",StringComparison.Ordinal)) Paint("[MINECRAFT TRACE]",ConsoleColor.Red,detail,true);
+                    else Paint("[LINKED]",ConsoleColor.Magenta,detail,true);
+                    return;
                 case "REVIEW": Paint("[REVIEW]",ConsoleColor.Yellow,detail,true);return;
                 case "GENERIC": Paint("[GENERIC]",ConsoleColor.DarkCyan,detail);return;
                 case "MINECRAFT CLIENT": Paint(kind,ConsoleColor.Cyan,detail,true);return;
@@ -300,6 +303,11 @@ public class PrestigeConsoleScannerV17 {
         return null;
     }
     static readonly Dictionary<int,long> LoadedSchedulerPids=new Dictionary<int,long>();
+    static int NativeTraceLevel(int mask) {
+        int legacyPair=3<<Markers.Length;
+        if((mask&3)!=0 || (mask&legacyPair)==legacyPair) return 2;
+        return (mask&HostBit)!=0?1:0;
+    }
     static void Memory() {
         var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
@@ -318,6 +326,7 @@ public class PrestigeConsoleScannerV17 {
             catch(InvalidOperationException){Log("Coverage incomplete: process exited during module enumeration");}
             long address=0,total=0; IntPtr allocation=IntPtr.Zero;int localMask=0; int failures=0;
             int mask=0;
+            int reportedNativeLevel=0;
             var inspectedAllocations=new HashSet<IntPtr>();
             var clock=Stopwatch.StartNew();
             byte[] buf=new byte[512*1024];
@@ -328,7 +337,7 @@ public class PrestigeConsoleScannerV17 {
                 while(clock.Elapsed.TotalSeconds<60 && VirtualQueryEx(h,new IntPtr(address),out r,(UIntPtr)Marshal.SizeOf(typeof(Region))).ToUInt64()>0) {
                     long end=checked(r.Base.ToInt64()+(long)r.Size.ToUInt64());
                     if(end<=address) break;
-                    if(allocation!=r.AllocationBase){allocation=r.AllocationBase;localMask=0;tail=0;}
+                    if(allocation!=r.AllocationBase){allocation=r.AllocationBase;localMask=0;reportedNativeLevel=0;tail=0;}
                     uint perm=r.Protect & 255;
                     if(r.State==0x1000 && r.Type==0x20000 && (r.Protect&256)==0 && perm>=16 &&
                         inspectedAllocations.Add(r.AllocationBase) && PrivateDll(h,r.AllocationBase))
@@ -349,16 +358,8 @@ public class PrestigeConsoleScannerV17 {
                                 Buffer.BlockCopy(buf,0,block,tail,n);
                                 int length=tail+n;
                                 int previous=mask;
-                                int priorLocal=localMask;
                                 localMask=MatchBlock(block,length,localMask);
                                 mask|=localMask;
-                                string moduleName;
-                                if(gamePids.Contains(pid) && localMask!=priorLocal && (moduleNames.TryGetValue(allocation,out moduleName)||privateImages.Contains(allocation))) {
-                                    int pair=3<<Markers.Length;
-                                    bool strong=((localMask^priorLocal)&3)!=0 || ((localMask&pair)==pair && (priorLocal&pair)!=pair);
-                                    if(strong || ((localMask^priorLocal)&HostBit)!=0)
-                                        Hit((strong?"LINKED":"REVIEW")+" | Minecraft PID "+pid+" | "+(strong?"Prestige loader markers":"Prestige hostname")+" in "+(moduleName??"private DLL-like memory")+" at 0x"+allocation.ToInt64().ToString("X"));
-                                }
                                 for(int i=0;i<Markers.Length;i++)
                                     if(((mask^previous)&(1<<i))!=0)
                                         Hit("REVIEW | JVM PID "+pid+" contains loader marker | "+Markers[i]+" | string presence alone does not establish execution");
@@ -377,9 +378,17 @@ public class PrestigeConsoleScannerV17 {
                         }
                     } else tail=0;
                     string backing;
-                    if(gamePids.Contains(pid) && (localMask&(HostBit|3))!=0 &&
-                        (moduleNames.TryGetValue(allocation,out backing)||privateImages.Contains(allocation)))
-                        RecordNativeRegion(pid,allocation,end,backing??"private DLL-like memory");
+                    if(gamePids.Contains(pid) && localMask!=0 &&
+                        (moduleNames.TryGetValue(allocation,out backing)||privateImages.Contains(allocation))){
+                        int level=NativeTraceLevel(localMask);
+                        if(level>reportedNativeLevel){
+                            reportedNativeLevel=level;
+                            Hit((level==2?"LINKED":"REVIEW")+" | Minecraft PID "+pid+" | "+
+                                (level==2?"Prestige loader endpoint or paired legacy markers":"Prestige hostname")+
+                                " in "+(backing??"private DLL-like memory")+" at 0x"+allocation.ToInt64().ToString("X"));
+                        }
+                        if(level>0) RecordNativeRegion(pid,allocation,end,backing??"private DLL-like memory");
+                    }
                     address=end;
                 }
                 if(MarkedRegions.ContainsKey(pid)) try {
@@ -680,7 +689,7 @@ public class PrestigeConsoleScannerV17 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV17' -as [type])) {
+if (!('PrestigeConsoleScannerV18' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -808,6 +817,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV17]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV18]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
