@@ -15,7 +15,7 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or ![Environment]::Is64BitProcess) 
     throw 'Open 64-bit Windows PowerShell 5.1 as administrator to run this scanner.'
 }
 
-Write-Host 'PRESTIGE SCANNER' -ForegroundColor Cyan
+Write-Host 'PRESTIGE SCANNER v23' -ForegroundColor Cyan
 Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
 Write-Host 'Discord:LeSqid' -ForegroundColor Gray
 Write-Host 'Starting scan...' -ForegroundColor Cyan
@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV22 {
+public class PrestigeConsoleScannerV23 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -374,6 +374,9 @@ public class PrestigeConsoleScannerV22 {
     }
     static void Memory() {
         var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
+        ScanJavaProcesses(processes);
+    }
+    static void ScanJavaProcesses(Process[] processes) {
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
         foreach(var p in processes) using(p) {
             int pid=p.Id;
@@ -394,6 +397,7 @@ public class PrestigeConsoleScannerV22 {
             int mask=0;
             int reportedNativeLevel=0;
             var inspectedAllocations=new HashSet<IntPtr>();
+            bool hostnameImageChecked=false;
             var clock=Stopwatch.StartNew();
             byte[] buf=new byte[512*1024];
             byte[] block=new byte[buf.Length+Overlap];
@@ -403,7 +407,7 @@ public class PrestigeConsoleScannerV22 {
                 while(clock.Elapsed.TotalSeconds<60 && VirtualQueryEx(h,new IntPtr(address),out r,(UIntPtr)Marshal.SizeOf(typeof(Region))).ToUInt64()>0) {
                     long end=checked(r.Base.ToInt64()+(long)r.Size.ToUInt64());
                     if(end<=address) break;
-                    if(allocation!=r.AllocationBase){allocation=r.AllocationBase;localMask=0;reportedNativeLevel=0;tail=0;}
+                    if(allocation!=r.AllocationBase){allocation=r.AllocationBase;localMask=0;reportedNativeLevel=0;tail=0;hostnameImageChecked=false;}
                     uint perm=r.Protect & 255;
                     if(r.State==0x1000 && r.Type==0x20000 && (r.Protect&256)==0 && perm>=16 &&
                         inspectedAllocations.Add(r.AllocationBase) && PrivateDll(h,r.AllocationBase))
@@ -444,12 +448,17 @@ public class PrestigeConsoleScannerV22 {
                         }
                     } else tail=0;
                     string backing;
-                    if(gamePids.Contains(pid) && localMask!=0 &&
-                        (moduleNames.TryGetValue(allocation,out backing)||privateImages.Contains(allocation))){
-                        if((localMask&HostBit)!=0 && !NativeHostModules.ContainsKey(pid) &&
-                           ((backing!=null && r.Type==0x1000000 && backing.EndsWith(".dll",StringComparison.OrdinalIgnoreCase)) ||
-                            privateImages.Contains(allocation)))
-                            NativeHostModules[pid]=backing??"private DLL-like memory";
+                    bool listed=moduleNames.TryGetValue(allocation,out backing);
+                    bool moduleCandidate=listed || privateImages.Contains(allocation);
+                    if(gamePids.Contains(pid) && (localMask&HostBit)!=0 && !hostnameImageChecked &&
+                       (moduleCandidate || r.Type==0x1000000)){
+                        hostnameImageChecked=true;
+                        if(privateImages.Contains(allocation) || PrivateDll(h,allocation)){
+                            if(!NativeHostModules.ContainsKey(pid))
+                                NativeHostModules[pid]=backing??"DLL image at 0x"+allocation.ToInt64().ToString("X");
+                        }
+                    }
+                    if(gamePids.Contains(pid) && localMask!=0 && moduleCandidate){
                         int moduleSize;
                         if((localMask&HostBit)!=0 && moduleSizes.TryGetValue(allocation,out moduleSize) && agentChecks.Add(allocation)){
                             string entry=InspectAgentModule(h,allocation,moduleSize);
@@ -478,6 +487,12 @@ public class PrestigeConsoleScannerV22 {
                 } catch(System.ComponentModel.Win32Exception){Log("Coverage incomplete: Minecraft thread check");}
                   catch(InvalidOperationException){Log("Coverage incomplete: Minecraft thread check");}
                 ReportSessionMarkers(pid,mask);
+                if(gamePids.Contains(pid)){
+                    string nativeHost;
+                    Log("Session evidence | PID "+pid+" | hostname in DLL: "+
+                        (NativeHostModules.TryGetValue(pid,out nativeHost)?nativeHost:"not observed")+
+                        " | TaskScheduler text: "+((mask&12)!=0?"found":"not observed"));
+                }
                 long classStart; DateTime memoryStart;
                 if(LoadedSchedulerPids.TryGetValue(pid,out classStart) && GameStarts.TryGetValue(pid,out memoryStart) && memoryStart.Ticks==classStart && (mask&HostBit)!=0)
                     Hit("LINKED | Minecraft PID "+pid+" | JVM reports TaskScheduler loaded and the Prestige API hostname was found in this process | injection unconfirmed");
@@ -781,7 +796,7 @@ public class PrestigeConsoleScannerV22 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV22' -as [type])) {
+if (!('PrestigeConsoleScannerV23' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -924,6 +939,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV22]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV23]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
