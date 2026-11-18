@@ -20,6 +20,27 @@ Write-Host 'Credits ' -ForegroundColor Magenta -NoNewline
 Write-Host 'Discord:LeSqid' -ForegroundColor Gray
 Write-Host 'Starting scan...' -ForegroundColor Cyan
 
+
+function Send-ScanStartNotice {
+    $saved = [Environment]::GetEnvironmentVariable('PrestigeScannerWebhook', 'User')
+    if (!$saved) { return }
+
+    try {
+        $secret = ConvertTo-SecureString $saved -ErrorAction Stop
+        try {
+            $url = [Net.NetworkCredential]::new('', $secret).Password.Trim()
+            if ($url -cnotmatch '\Ahttps://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+(?:\?thread_id=[0-9]+)?\z') {
+                throw 'Invalid webhook configuration'
+            }
+            Write-Host 'Sending scan-start notice to Discord...' -ForegroundColor DarkGray
+            $null = Invoke-RestMethod -Method Post -Uri $url -ContentType 'application/json' -Body '{"content":"Prestige Scanner started."}' -TimeoutSec 4 -MaximumRedirection 0 -ErrorAction Stop -Verbose:$false -Debug:$false
+        } finally { $secret.Dispose() }
+    } catch {
+        Write-Host 'Discord notice failed. Continuing scan.' -ForegroundColor Yellow
+    }
+}
+Send-ScanStartNotice
+
 $engine = @'
 using System;
 using System.Collections.Generic;
