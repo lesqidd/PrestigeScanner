@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV21 {
+public class PrestigeConsoleScannerV22 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -75,6 +75,7 @@ public class PrestigeConsoleScannerV21 {
             switch(kind){
                 case "EXACT": Paint("[DIRECT PRESTIGE MATCH]",ConsoleColor.Red,detail,true);return;
                 case "FILE INDICATOR": Paint("[FILE INDICATOR]",ConsoleColor.Yellow,detail,true,true);return;
+                case "SUSPECTED INJECTION": Paint("[SUSPECTED INJECTION]",ConsoleColor.Red,detail,true);return;
                 case "LINKED":
                     if(detail.StartsWith(" | Minecraft PID ",StringComparison.Ordinal)) Paint("[MINECRAFT TRACE]",ConsoleColor.Red,detail,true);
                     else Paint("[LINKED]",ConsoleColor.Magenta,detail,true);
@@ -362,6 +363,15 @@ public class PrestigeConsoleScannerV21 {
            count.ToUInt64()!=size)return null;
         return JavaAgentExport(directory,rva,(uint)moduleSize);
     }
+    static readonly Dictionary<int,string> NativeHostModules=new Dictionary<int,string>();
+    static void ReportSessionMarkers(int pid,int mask) {
+        string module;
+        if(!NativeHostModules.TryGetValue(pid,out module))return;
+        int slash=Array.IndexOf(Markers,"net/taskflow/sched/TaskScheduler");
+        int dotted=Array.IndexOf(Markers,"net.taskflow.sched.TaskScheduler");
+        if((mask&((1<<slash)|(1<<dotted)))!=0)
+            Hit("SUSPECTED INJECTION | Minecraft PID "+pid+" | Prestige hostname in "+module+" and TaskScheduler marker in this process | text correlation; execution unverified");
+    }
     static void Memory() {
         var processes=Process.GetProcessesByName("java").Concat(Process.GetProcessesByName("javaw")).OrderByDescending(p=>gamePids.Contains(p.Id)).ToArray();
         Log("Live Java processes: "+processes.Length+" (includes non-Minecraft JVMs)");
@@ -436,6 +446,10 @@ public class PrestigeConsoleScannerV21 {
                     string backing;
                     if(gamePids.Contains(pid) && localMask!=0 &&
                         (moduleNames.TryGetValue(allocation,out backing)||privateImages.Contains(allocation))){
+                        if((localMask&HostBit)!=0 && !NativeHostModules.ContainsKey(pid) &&
+                           ((backing!=null && r.Type==0x1000000 && backing.EndsWith(".dll",StringComparison.OrdinalIgnoreCase)) ||
+                            privateImages.Contains(allocation)))
+                            NativeHostModules[pid]=backing??"private DLL-like memory";
                         int moduleSize;
                         if((localMask&HostBit)!=0 && moduleSizes.TryGetValue(allocation,out moduleSize) && agentChecks.Add(allocation)){
                             string entry=InspectAgentModule(h,allocation,moduleSize);
@@ -463,6 +477,7 @@ public class PrestigeConsoleScannerV21 {
                     }
                 } catch(System.ComponentModel.Win32Exception){Log("Coverage incomplete: Minecraft thread check");}
                   catch(InvalidOperationException){Log("Coverage incomplete: Minecraft thread check");}
+                ReportSessionMarkers(pid,mask);
                 long classStart; DateTime memoryStart;
                 if(LoadedSchedulerPids.TryGetValue(pid,out classStart) && GameStarts.TryGetValue(pid,out memoryStart) && memoryStart.Ticks==classStart && (mask&HostBit)!=0)
                     Hit("LINKED | Minecraft PID "+pid+" | JVM reports TaskScheduler loaded and the Prestige API hostname was found in this process | injection unconfirmed");
@@ -564,11 +579,14 @@ public class PrestigeConsoleScannerV21 {
                         if(id.Length>0) known.Add(id);
                     }
                     if(e.Id==22 && v("QueryName").TrimEnd('.').Equals(Host,StringComparison.OrdinalIgnoreCase)) {
-                        int queryPid; DateTime started;
+                        int queryPid=0; DateTime started;
                         bool current=Java(v("Image")) && int.TryParse(v("ProcessId"),out queryPid) &&
                             GameStarts.TryGetValue(queryPid,out started) && e.TimeCreated.HasValue &&
                             e.TimeCreated.Value.ToUniversalTime()>=started && SameLiveProcess(queryPid,started);
-                        Hit("REVIEW | "+(current?"Running Minecraft session":"Process")+" queried Prestige API | "+v("Image")+" PID "+v("ProcessId")+where);
+                        string nativeModule;
+                        if(current && NativeHostModules.TryGetValue(queryPid,out nativeModule))
+                            Hit("LINKED | Minecraft PID "+queryPid+" | Sysmon recorded a DNS query for the Prestige API and the hostname is present in "+nativeModule+where);
+                        else Hit("REVIEW | "+(current?"Running Minecraft session":"Process")+" queried Prestige API | "+v("Image")+" PID "+v("ProcessId")+where);
                     }
                     if(e.TimeCreated.HasValue) {
                         bool dns=e.Id==22 && Java(v("Image")) && String.Equals(v("QueryName").TrimEnd('.'),Host,StringComparison.OrdinalIgnoreCase);
@@ -723,7 +741,7 @@ public class PrestigeConsoleScannerV21 {
         if(label!=null) Log(Environment.NewLine+"--- "+label+" ---");
         try {action();} catch(Exception e){Log("Coverage incomplete: "+(label??"File scan")+" - "+e.Message);}
     }
-    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { LoadedSchedulerPids.Clear(); MarkedRegions.Clear(); Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
+    public static int Scan(string[] args,int[] minecraftIds,string[] extra) { LoadedSchedulerPids.Clear(); NativeHostModules.Clear(); MarkedRegions.Clear(); Findings.Clear(); GameStarts.Clear(); gamePids=new HashSet<int>(minecraftIds);
         try {
             string mode=args.Length>0?args[0]:Console.ReadLine();
             if(mode!="1" && mode!="2" && mode!="3"){Console.WriteLine("Choose 1, 2 or 3.");return 2;}
@@ -763,7 +781,7 @@ public class PrestigeConsoleScannerV21 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV21' -as [type])) {
+if (!('PrestigeConsoleScannerV22' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -906,6 +924,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV21]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV22]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
