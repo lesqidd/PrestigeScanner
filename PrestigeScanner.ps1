@@ -35,7 +35,7 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
-public class PrestigeConsoleScannerV18 {
+public class PrestigeConsoleScannerV19 {
     const string Jar = "c2a6f8fb26c88eb9fc823fc9dd8373f268cdacdc59b2b636ace353a9b0dc59f1";
     const string Exe = "d7508c0022d959e4566d2cc1742cc0b7752b6fd1e692ecab7cef7ac6b9d8eec3";
     const string Host = "api.prestigeclient.vip";
@@ -182,10 +182,19 @@ public class PrestigeConsoleScannerV18 {
         }
         return hashes;
     }
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileHandleInfo {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Created,Accessed,Written;
+        public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow;
+    }
+    [DllImport("kernel32.dll",SetLastError=true)]
+    static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file,out FileHandleInfo info);
+
     static void Disk(string[] roots) {
         int files=0, hashes=0, errors=0, links=0;
         ReferenceLengths.Clear(); RefClasses.Clear(); var jarCandidates=new List<string>();
-        var pending=new Stack<FileSystemInfo>(roots.Select(p=>(FileSystemInfo)new DirectoryInfo(p)));
+        var pending=new Stack<FileSystemInfo>(roots.Where(p=>!String.IsNullOrWhiteSpace(p)).Select(p=>(FileSystemInfo)new DirectoryInfo(p)));
         var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         while(pending.Count>0 && files<250000) {
             var item=pending.Pop(); string path=item.FullName;
@@ -206,7 +215,11 @@ public class PrestigeConsoleScannerV18 {
                     using(var f=File.OpenRead(path)) using(var sha=SHA256.Create()) {
                         string h=BitConverter.ToString(sha.ComputeHash(f)).Replace("-","").ToLowerInvariant();
                         string sample=Sample(h);
-                        if(sample!=null){if(h.Equals(Jar,StringComparison.OrdinalIgnoreCase))RefClasses.UnionWith(ClassHashes(path,true));Hit("EXACT | "+sample+" on disk | "+path+" | "+h);continue;}
+                        if(sample!=null){if(h.Equals(Jar,StringComparison.OrdinalIgnoreCase))RefClasses.UnionWith(ClassHashes(path,true));Hit("EXACT | "+sample+" on disk | "+path+" | "+h);
+                            FileHandleInfo info;
+                            if(GetFileInformationByHandle(f.SafeFileHandle,out info) && info.Links>1)
+                                Hit("REVIEW | Known loader has "+info.Links+" hard links | "+path);
+                            continue;}
                     }
                 }
                 if(path.EndsWith(".jar",StringComparison.OrdinalIgnoreCase) && length<=4*1024*1024 && length>0) {
@@ -305,7 +318,8 @@ public class PrestigeConsoleScannerV18 {
     static readonly Dictionary<int,long> LoadedSchedulerPids=new Dictionary<int,long>();
     static int NativeTraceLevel(int mask) {
         int legacyPair=3<<Markers.Length;
-        if((mask&3)!=0 || (mask&legacyPair)==legacyPair) return 2;
+        if((mask&3)!=0 || (mask&legacyPair)==legacyPair ||
+           ((mask&HostBit)!=0 && (mask&12)!=0)) return 2;
         return (mask&HostBit)!=0?1:0;
     }
     static void Memory() {
@@ -384,7 +398,7 @@ public class PrestigeConsoleScannerV18 {
                         if(level>reportedNativeLevel){
                             reportedNativeLevel=level;
                             Hit((level==2?"LINKED":"REVIEW")+" | Minecraft PID "+pid+" | "+
-                                (level==2?"Prestige loader endpoint or paired legacy markers":"Prestige hostname")+
+                                (level==2?((localMask&3)!=0?"Prestige loader endpoint":(localMask&(3<<Markers.Length))==(3<<Markers.Length)?"paired Prestige legacy markers":"Prestige hostname and TaskScheduler class marker"):"Prestige hostname")+
                                 " in "+(backing??"private DLL-like memory")+" at 0x"+allocation.ToInt64().ToString("X"));
                         }
                         if(level>0) RecordNativeRegion(pid,allocation,end,backing??"private DLL-like memory");
@@ -471,19 +485,31 @@ public class PrestigeConsoleScannerV18 {
         var apiQueries=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
         var remoteThreads=new Dictionary<string,DateTime>(StringComparer.OrdinalIgnoreCase);
         // Collect process identities before correlating events.
-        foreach(var ids in new[]{new[]{1},new[]{8,22,23,26}}) {
+        foreach(var ids in new[]{new[]{1},new[]{8,22,23,26},new[]{10},new[]{13}}) {
             string query="*[System[("+String.Join(" or ",ids.Select(i=>"EventID="+i))+") and TimeCreated[timediff(@SystemTime) <= 604800000]]]";
+            if(ids[0]==10 && known.Count==0)continue;
             var q=new EventLogQuery(channel,kindOfPath,query){ReverseDirection=true};
             int records=0;
             using(var reader=new EventLogReader(q)) {
                 EventRecord e;
                 while(records<50000 && (e=reader.ReadEvent())!=null) using(e) {
                     records++;
-                    var values=XDocument.Parse(e.ToXml()).Descendants().Where(x=>x.Name.LocalName=="Data" && x.Attribute("Name")!=null).ToDictionary(x=>(string)x.Attribute("Name"),x=>x.Value);
+                    var values=XDocument.Parse(e.ToXml()).Descendants().Where(x=>x.Name.LocalName=="Data" && x.Attribute("Name")!=null).ToDictionary(x=>(string)x.Attribute("Name"),x=>x.Value,StringComparer.OrdinalIgnoreCase);
                     Func<string,string> v=k=>values.ContainsKey(k)?values[k]:"";
                     string kind=Sample(v("Hashes")), id=v("ProcessGuid"), target=v("TargetFilename");
                     string when=e.TimeCreated.HasValue?e.TimeCreated.Value.ToUniversalTime().ToString("u"):"time unknown";
                     string where=" | "+when+" | Sysmon "+e.Id+" record "+e.RecordId;
+                    if(e.Id==13 && v("TargetObject").EndsWith(@"\Memory Management\PrefetchParameters\EnablePrefetcher",StringComparison.OrdinalIgnoreCase))
+                        Hit("GENERIC | Prefetch setting changed | "+v("Details")+where);
+                    if(e.Id==1 && String.Equals(Path.GetFileName(v("Image")),"fsutil.exe",StringComparison.OrdinalIgnoreCase) &&
+                       Regex.IsMatch(v("CommandLine"),@"(?i)\busn\s+deletejournal\b"))
+                        Hit("GENERIC | USN journal deletion command recorded | outcome unknown"+where);
+                    if((e.Id==8 || e.Id==10) && known.Contains(v("SourceProcessGuid")) && Java(v("TargetImage"))){
+                        int pid; DateTime started;
+                        if(int.TryParse(v("TargetProcessId"),out pid) && GameStarts.TryGetValue(pid,out started) &&
+                           e.TimeCreated.HasValue && e.TimeCreated.Value.ToUniversalTime()>=started && SameLiveProcess(pid,started))
+                            Hit("LINKED | Minecraft PID "+pid+" | Known loader "+(e.Id==8?"created a remote thread":"accessed this process with rights "+v("GrantedAccess"))+where);
+                    }
                     if(e.Id==1 && IsShell(v("Image"))) CheckCommand(v("CommandLine"),where);
                     if(e.Id==22 && v("QueryName").TrimEnd('.').Equals("prestigeclient.vip",StringComparison.OrdinalIgnoreCase))
                         Hit("REVIEW | Launcher domain DNS query by "+v("Image")+where+" | endpoint and execution unknown");
@@ -671,7 +697,7 @@ public class PrestigeConsoleScannerV18 {
             if(mode!="2") Run("Live Java memory",Memory);
             if(mode!="1") {
                 string user=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
+                string[] roots=args.Length>1?args.Skip(1).ToArray():new[]{Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),Path.Combine(user,"Downloads"),Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),Path.GetTempPath(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),".minecraft")};
                 Paint("Checking files and history...",ConsoleColor.Cyan);
                 var disk=System.Threading.Tasks.Task.Factory.StartNew(delegate {Run(null,delegate {Disk(roots);});}, System.Threading.CancellationToken.None,System.Threading.Tasks.TaskCreationOptions.None,System.Threading.Tasks.TaskScheduler.Default);
                 try {
@@ -689,7 +715,7 @@ public class PrestigeConsoleScannerV18 {
 }
 
 '@
-if (!('PrestigeConsoleScannerV18' -as [type])) {
+if (!('PrestigeConsoleScannerV19' -as [type])) {
     Add-Type -TypeDefinition $engine -ReferencedAssemblies 'System.dll','System.Core.dll','System.Xml.Linq.dll','System.Xml.dll','System.IO.Compression.dll'
 }
 function Find-JvmDiagnostic([string]$image) {
@@ -779,6 +805,21 @@ function Get-GameDiagnostics($row) {
     }
 }
 function Get-HistoricalIndicators {
+    foreach($root in 'HKCU:','HKLM:'){
+        foreach($subkey in 'Run','RunOnce'){
+            $key=Get-Item -LiteralPath "$root\Software\Microsoft\Windows\CurrentVersion\$subkey" -ErrorAction SilentlyContinue
+            if(!$key){continue}
+            foreach($name in $key.GetValueNames()){
+                $value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if($value -is [string] -and $value -match '(?i)^\s*(?:"(?:[^"]*\\)?javaw?(?:\.exe)?"|(?:[^\s"]*\\)?javaw?(?:\.exe)?)\s+.*?-jar\s+(?:"([^"]+)"|(.+?))\s*$'){
+                    $target=($Matches[1]+$Matches[2]).Trim()
+                    if($target -match '(?i)\.(exe|txt)$'){
+                        "REVIEW | Java startup entry targets a $($Matches[1]) file | $root\$subkey\$name | $target"
+                    }
+                }
+            }
+        }
+    }
     $names='(?i)icloudjsclownht2ogv\.exe|lesqid is gay\.jar|taskflow-2\.5\.15\.jar'
     $cache=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction SilentlyContinue
     if($cache -and $cache.AppCompatCache -is [byte[]]) {
@@ -817,6 +858,6 @@ if ($Mode -ne '2') {
 if ($Mode -ne '1') {
     try { Get-HistoricalIndicators | ForEach-Object {$extra.Add([string]$_)} } catch {$extra.Add("Coverage incomplete: history inspection interrupted")}
 }
-$status = [PrestigeConsoleScannerV18]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
+$status = [PrestigeConsoleScannerV19]::Scan([string[]]@($Mode), [int[]]$minecraftIds, $extra.ToArray())
 if ($status -ne 0) { throw "Scanner exited with code $status." }
 
